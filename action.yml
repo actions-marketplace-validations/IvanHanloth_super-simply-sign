@@ -1,5 +1,5 @@
 name: 'Super Simply Sign'
-description: 'Authenticode-sign Windows binaries with a Certum SimplySign cloud certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
+description: 'Sign Windows binaries with Certum SimplySign certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
 author: 'IvanHanloth'
 
 branding:

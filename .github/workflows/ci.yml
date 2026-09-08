@@ -12,12 +12,16 @@ permissions:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [24]
+        include:
+          - os: ubuntu-latest
+            node: 26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -25,7 +29,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - run: npm ci
@@ -36,7 +40,7 @@ jobs:
       # The runner executes dist/index.cjs straight from the repository, so
       # what is committed must be exactly what the sources build to.
       - name: dist/ is committed and up to date
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.node == 24
         run: |
           if ! git diff --quiet -- dist/; then
             echo "::error::dist/index.cjs is out of date — run 'npm run build' and commit the result"

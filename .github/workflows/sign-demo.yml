@@ -1,0 +1,49 @@
+# Dogfooding: sign the test fixture with a real Certum certificate, by hand
+# only, behind the protected `signing` environment. Nothing here runs unless
+# someone clicks "Run workflow" *and* a required reviewer approves the
+# deployment — that approval is what stands between a pull request and the
+# signing credentials.
+name: Sign demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: 'Program name to embed in the signature'
+        default: 'Super Simply Sign demo'
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    environment: signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Sign hello.exe with the Certum cloud certificate
+        id: sign
+        uses: ./
+        with:
+          files: tests/fixtures/hello.exe
+          output-dir: signed
+          description: ${{ inputs.description }}
+          url: https://github.com/${{ github.repository }}
+          email: ${{ secrets.CERTUM_EMAIL }}
+          otp-seed: ${{ secrets.CERTUM_OTP }}
+
+      - name: Show what was signed
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed-files }}
+          SUBJECT: ${{ steps.sign.outputs.certificate-subject }}
+        run: |
+          echo "signer: $SUBJECT"
+          echo "$SIGNED" | jq .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signed-hello
+          path: signed/

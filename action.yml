@@ -1,0 +1,85 @@
+name: 'Super Simply Sign'
+description: 'Authenticode-sign Windows binaries with a Certum SimplySign cloud certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
+author: 'IvanHanloth'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  files:
+    description: >-
+      Files to sign: glob patterns, one per line (or comma-separated).
+      PE images only (.exe, .dll, .sys, .ocx, .cpl, …).
+    required: true
+  email:
+    description: 'Certum account e-mail. Falls back to $CERTUM_EMAIL.'
+    required: false
+  otp-seed:
+    description: >-
+      TOTP seed of the SimplySign authenticator: a base32 secret or the full otpauth:// URI.
+      Long-lived — keep it in a protected environment secret. Falls back to $CERTUM_OTP.
+      Mutually exclusive with otp-code.
+    required: false
+  otp-code:
+    description: >-
+      A current 6-digit code from the SimplySign authenticator, for a one-off run
+      without handing the seed to CI. Falls back to $CERTUM_TOKEN.
+    required: false
+  timestamp-url:
+    description: 'RFC 3161 timestamp authority. An empty string disables timestamping (not recommended).'
+    required: false
+    default: 'http://time.certum.pl/'
+  description:
+    description: 'Program name embedded in the signature (what Windows shows as the signed item).'
+    required: false
+  url:
+    description: 'Information URL embedded in the signature.'
+    required: false
+  output-dir:
+    description: 'Write the signed files here (same base names) instead of replacing the inputs in place.'
+    required: false
+  backup:
+    description: 'When signing in place, keep the original next to it as <file>.orig.'
+    required: false
+    default: 'false'
+  replace-existing-signature:
+    description: 'Strip and replace an existing Authenticode signature instead of failing on it.'
+    required: false
+    default: 'false'
+  chain-file:
+    description: >-
+      PEM bundle with additional intermediate certificates to embed.
+      The Certum Code Signing 2021 CA is built in.
+    required: false
+  card-serial:
+    description: 'Serial (cardno) of the SimplySign card to sign with, when the account has several.'
+    required: false
+  verify:
+    description: 'Re-parse and cryptographically verify every signed file before it is written.'
+    required: false
+    default: 'true'
+  allow-pull-request:
+    description: 'Permit running on pull_request events. Off by default: signing must never be triggerable by a PR.'
+    required: false
+    default: 'false'
+  fail-on-no-files:
+    description: 'Fail when the patterns match no file.'
+    required: false
+    default: 'true'
+
+outputs:
+  signed-files:
+    description: 'JSON array of { path, sha256, bytes, timestamp } for every signed file.'
+  signed-count:
+    description: 'Number of files signed.'
+  certificate-subject:
+    description: 'Subject of the signing certificate.'
+  certificate-fingerprint:
+    description: 'SHA-256 fingerprint of the signing certificate.'
+  certificate-not-after:
+    description: 'Expiry of the signing certificate (ISO 8601).'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.cjs'

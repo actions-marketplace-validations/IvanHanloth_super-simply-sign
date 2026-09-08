@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # The runner executes dist/index.cjs straight from the repository, so
+      # what is committed must be exactly what the sources build to.
+      - name: dist/ is committed and up to date
+        if: runner.os == 'Linux'
+        run: |
+          if ! git diff --quiet -- dist/; then
+            echo "::error::dist/index.cjs is out of date — run 'npm run build' and commit the result"
+            git --no-pager diff --stat -- dist/
+            exit 1
+          fi
+
+  smoke:
+    # Run the built action on a real node24 runner with no credentials: it must
+    # stop on its guard rails with a clear error, never a stack trace.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Missing authentication is reported cleanly
+        id: noauth
+        continue-on-error: true
+        uses: ./
+        with:
+          files: tests/fixtures/hello.exe
+          email: nobody@example.com
+
+      # A run with nothing to sign exits before any network activity, so this
+      # exercises the success path (outputs, summary) without credentials.
+      - name: Nothing to sign is a clean success with outputs
+        id: nothing
+        uses: ./
+        with:
+          files: tests/fixtures/*.nothing
+          fail-on-no-files: false
+          email: nobody@example.com
+          otp-code: '123456'
+
+      - name: Outcomes are as expected
+        env:
+          NOAUTH: ${{ steps.noauth.outcome }}
+          COUNT: ${{ steps.nothing.outputs.signed-count }}
+          FILES: ${{ steps.nothing.outputs.signed-files }}
+        run: |
+          test "$NOAUTH" = failure
+          test "$COUNT" = 0
+          test "$FILES" = '[]'

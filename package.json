@@ -1,0 +1,27 @@
+{
+  "name": "super-simply-sign",
+  "version": "1.0.0",
+  "description": "GitHub Action: Authenticode-sign Windows binaries with a Certum SimplySign cloud certificate over plain HTTPS — Node 24, no vendor stack, no third-party crypto.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.cjs --legal-comments=none --log-level=warning",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/glob": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.0"
+  }
+}

@@ -34,7 +34,7 @@ test('messageDigest hashes the SpcIndirectDataContent *content* (reference vecto
 
 test('prepare() builds sorted signed attributes and the digest the HSM signs', () => {
   const plain = prepare(hello, { signingTime: new Date(Date.UTC(2026, 6, 10, 7, 18, 1)) });
-  assert.equal(plain.peHash.toString('hex'), authenticodeHash(hello).toString('hex'));
+  assert.equal(plain.digest.toString('hex'), authenticodeHash(hello).toString('hex'));
   const attrs = parseAttributes(der.readExact(plain.signedAttrsSet));
   assert.equal(attrs.length, 4);
   const encodings = der.children(der.readExact(plain.signedAttrsSet)).map((t) => t.raw);
@@ -66,7 +66,7 @@ test('a locally assembled signature verifies, with the chain and opus info intac
   const signed = finalize(hello, prepared, signature, leafInfo, [caInfo], null);
   const result = verifySignedPe(signed);
   assert.equal(result.hashAlgorithm, 'sha256');
-  assert.equal(result.peHash.toString('hex'), prepared.peHash.toString('hex'));
+  assert.equal(result.digest.toString('hex'), prepared.digest.toString('hex'));
   assert.equal(result.signer.x509.fingerprint256, leafInfo.x509.fingerprint256);
   assert.deepEqual(
     result.certificates.map((c) => c.x509.subject),

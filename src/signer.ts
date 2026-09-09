@@ -1,24 +1,28 @@
 /**
  * The pipeline: one authenticated cloud session (login → card → certificate)
- * that signs any number of PE images, each as
+ * that signs any number of files — PE images and MSI packages — each as
  *
- *   prepare → cloud signature → check it against the certificate →
- *   RFC 3161 timestamp (checked) → assemble PKCS#7 → embed → self-verify.
+ *   digest → signed attributes → cloud signature → check it against the
+ *   certificate → RFC 3161 timestamp (checked) → assemble PKCS#7 → embed →
+ *   self-verify.
  *
  * Nothing here touches the disk and no token is ever persisted: the session
  * lives exactly as long as the process that logged in.
  */
 import { verify as cryptoVerify } from 'node:crypto';
 import { CERTUM_OAUTH, login, type OAuthConfig } from './auth.ts';
-import { finalize, prepare } from './authenticode.ts';
+import { buildSignedData, prepare, prepareIndirectData, type PreparedSignature } from './authenticode.ts';
 import { CERTUM_CODE_SIGNING_2021_CA_DER } from './certs/certum-code-signing-2021-ca.ts';
+import { parseCompoundFile, writeCompoundFile } from './cfb.ts';
 import { asBuffer } from './der.ts';
 import { HttpClient } from './http.ts';
+import { detectImageKind, type ImageKind } from './image.ts';
 import { silentLogger, type Logger } from './log.ts';
-import { parsePeLayout, stripSignature } from './pe.ts';
+import { embedMsiSignature, isMsiSigned, msiDigest, msiPrehash, spcSipInfo, stripMsiSignature, withExtendedSignature } from './msi.ts';
+import { embedSignature, parsePeLayout, stripSignature } from './pe.ts';
 import { fetchCard, requestSignature, type CloudCard, type ScsClient } from './scs.ts';
 import { fetchTimestamp, type TimestampToken } from './timestamp.ts';
-import { verifySignedPe, type VerificationResult } from './verify.ts';
+import { verifySignedMsi, verifySignedPe, type VerificationResult } from './verify.ts';
 import { OID_EKU_CODE_SIGNING, buildChain, oneLineName, parseCertificate, pemToDer, type CertificateInfo } from './x509.ts';
 
 export const VERSION = '1.0.0';
@@ -126,7 +130,7 @@ export interface SignOptions {
   readonly extraCertificates?: readonly CertificateInfo[];
   readonly signingTime?: Date;
   readonly replaceExistingSignature?: boolean;
-  /** Re-verify the produced image before returning it (default true). */
+  /** Re-verify the produced file before returning it (default true). */
   readonly verify?: boolean;
   readonly timeoutMs?: number;
   readonly userAgent?: string;
@@ -134,8 +138,10 @@ export interface SignOptions {
 }
 
 export interface SignResult {
+  readonly kind: ImageKind;
   readonly signed: Buffer;
-  readonly peHash: Buffer;
+  /** The Authenticode digest of the file that was signed. */
+  readonly digest: Buffer;
   readonly signature: Buffer;
   readonly timestamp: TimestampToken | null;
   /** The intermediates that were embedded after the signer certificate. */
@@ -143,19 +149,14 @@ export interface SignResult {
   readonly verification: VerificationResult | null;
 }
 
-/** Sign one PE image through `session`; returns the signed image (the input is not modified). */
-export async function signPe(session: CloudSession, pe: Uint8Array, options: SignOptions = {}): Promise<SignResult> {
-  const log = options.log ?? silentLogger;
-  let image = asBuffer(pe);
-  if (parsePeLayout(image).certTableSize !== 0) {
-    if (!options.replaceExistingSignature) throw new SignError('the file already carries a signature (enable replace-existing-signature to replace it)');
-    log.info('replacing the existing signature');
-    image = stripSignature(image);
-  }
-
-  const prepared = prepare(image, { description: options.description, url: options.url, signingTime: options.signingTime ?? new Date() });
-  log.debug(`authenticode sha256 ${prepared.peHash.toString('hex')}`);
-
+/** The format-independent middle of the pipeline: cloud signature, its check, timestamp, chain — then the PKCS#7. */
+async function signPrepared(
+  session: CloudSession,
+  prepared: PreparedSignature,
+  options: SignOptions,
+  log: Logger,
+): Promise<{ pkcs7: Buffer; signature: Buffer; timestamp: TimestampToken | null; chain: CertificateInfo[] }> {
+  log.debug(`authenticode sha256 ${prepared.digest.toString('hex')}`);
   const signature = await session.signDigest(prepared.toBeSigned);
   if (!cryptoVerify('sha256', prepared.signedAttrsSet, session.certificate.x509.publicKey, signature)) {
     throw new SignError('the cloud returned a signature that does not verify with the signing certificate — refusing to embed it');
@@ -176,15 +177,73 @@ export async function signPe(session: CloudSession, pe: Uint8Array, options: Sig
   const { chain, missingIssuer } = buildChain(session.certificate, [...(options.extraCertificates ?? []), CERTUM_INTERMEDIATE]);
   if (missingIssuer) log.warning(`no certificate for issuer "${missingIssuer}" is available to embed; verifiers will have to obtain it themselves`);
 
-  const signed = finalize(image, prepared, signature, session.certificate, chain, timestamp?.token ?? null);
+  const pkcs7 = buildSignedData(prepared, signature, session.certificate, chain, timestamp?.token ?? null);
+  return { pkcs7, signature, timestamp, chain };
+}
+
+function checkSelfVerification(session: CloudSession, verification: VerificationResult, prepared: PreparedSignature, timestamp: TimestampToken | null): void {
+  if (verification.signer.x509.fingerprint256 !== session.certificate.x509.fingerprint256) {
+    throw new SignError('self-verification found a different signer certificate than the session certificate');
+  }
+  if (!verification.digest.equals(prepared.digest)) throw new SignError('self-verification recomputed a different file digest than the one that was signed');
+  if (timestamp && !verification.timestamp) throw new SignError('self-verification could not find the embedded timestamp');
+}
+
+const alreadySigned = (options: SignOptions, log: Logger): void => {
+  if (!options.replaceExistingSignature) throw new SignError('the file already carries a signature (enable replace-existing-signature to replace it)');
+  log.info('replacing the existing signature');
+};
+
+/** Sign one PE image through `session`; returns the signed image (the input is not modified). */
+export async function signPe(session: CloudSession, pe: Uint8Array, options: SignOptions = {}): Promise<SignResult> {
+  const log = options.log ?? silentLogger;
+  let image = asBuffer(pe);
+  if (parsePeLayout(image).certTableSize !== 0) {
+    alreadySigned(options, log);
+    image = stripSignature(image);
+  }
+  const prepared = prepare(image, { description: options.description, url: options.url, signingTime: options.signingTime ?? new Date() });
+  const { pkcs7, signature, timestamp, chain } = await signPrepared(session, prepared, options, log);
+  const signed = embedSignature(image, pkcs7);
 
   let verification: VerificationResult | null = null;
   if (options.verify !== false) {
     verification = verifySignedPe(signed);
-    if (verification.signer.x509.fingerprint256 !== session.certificate.x509.fingerprint256) {
-      throw new SignError('self-verification found a different signer certificate than the session certificate');
-    }
-    if (timestamp && !verification.timestamp) throw new SignError('self-verification could not find the embedded timestamp');
+    checkSelfVerification(session, verification, prepared, timestamp);
   }
-  return { signed, peHash: prepared.peHash, signature, timestamp, chain, verification };
+  return { kind: 'pe', signed, digest: prepared.digest, signature, timestamp, chain, verification };
+}
+
+/**
+ * Sign one MSI package through `session`; returns the signed package (the
+ * input is not modified). The package is re-laid-out around the new
+ * `\x05DigitalSignature` stream, and `\x05MsiDigitalSignatureEx` is always
+ * written so the signature also covers the directory metadata.
+ */
+export async function signMsi(session: CloudSession, bytes: Uint8Array, options: SignOptions = {}): Promise<SignResult> {
+  const log = options.log ?? silentLogger;
+  const parsed = parseCompoundFile(bytes);
+  if (isMsiSigned(parsed)) alreadySigned(options, log);
+  // Drop any signature streams (a stale MsiDigitalSignatureEx too), compute
+  // the metadata digest, put it in its stream, then hash the tree as a
+  // verifier will see it.
+  const file = stripMsiSignature(parsed);
+  const prehash = msiPrehash(file, 'sha256');
+  const withExtended = withExtendedSignature(file, prehash);
+  const digest = msiDigest(withExtended, 'sha256');
+  const prepared = prepareIndirectData(spcSipInfo(), digest, { description: options.description, url: options.url, signingTime: options.signingTime ?? new Date() });
+  const { pkcs7, signature, timestamp, chain } = await signPrepared(session, prepared, options, log);
+  const signed = writeCompoundFile(embedMsiSignature(withExtended, pkcs7, prehash));
+
+  let verification: VerificationResult | null = null;
+  if (options.verify !== false) {
+    verification = verifySignedMsi(signed);
+    checkSelfVerification(session, verification, prepared, timestamp);
+  }
+  return { kind: 'msi', signed, digest, signature, timestamp, chain, verification };
+}
+
+/** Sign a PE image or an MSI package, whichever `bytes` is. */
+export async function signFile(session: CloudSession, bytes: Uint8Array, options: SignOptions = {}): Promise<SignResult> {
+  return detectImageKind(bytes) === 'pe' ? signPe(session, bytes, options) : signMsi(session, bytes, options);
 }

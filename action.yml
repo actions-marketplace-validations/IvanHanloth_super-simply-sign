@@ -1,5 +1,5 @@
 name: 'Super Simply Sign'
-description: 'Sign Windows binaries with Certum SimplySign certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
+description: 'Sign Windows binaries (PE) and installers (MSI) with a Certum SimplySign certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
 author: 'IvanHanloth'
 
 branding:
@@ -10,7 +10,8 @@ inputs:
   files:
     description: >-
       Files to sign: glob patterns, one per line (or comma-separated).
-      PE images only (.exe, .dll, .sys, .ocx, .cpl, …).
+      PE images (.exe, .dll, .sys, .ocx, .cpl, …) and Windows Installer packages (.msi, .msm, .msp);
+      the format is detected from the file contents, not the extension.
     required: true
   email:
     description: 'Certum account e-mail. Falls back to $CERTUM_EMAIL.'
@@ -70,7 +71,7 @@ inputs:
 
 outputs:
   signed-files:
-    description: 'JSON array of { path, sha256, bytes, timestamp } for every signed file.'
+    description: 'JSON array of { path, kind ("pe" | "msi"), sha256, bytes, timestamp } for every signed file.'
   signed-count:
     description: 'Number of files signed.'
   certificate-subject:

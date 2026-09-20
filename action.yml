@@ -1,5 +1,5 @@
 name: 'Super Simply Sign'
-description: 'Sign Windows binaries(exe, msi…) with a Certum SimplySign certificate over plain HTTPS — no SimplySign Desktop, no PKCS#11, any runner OS.'
+description: 'Sign Windows binaries(exe, msi…) with a Certum SimplySign certificate over plain HTTPS. Runs on any runner OS.'
 author: 'IvanHanloth'
 
 branding:

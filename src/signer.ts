@@ -94,6 +94,7 @@ export class CloudSession {
       userAgent: options.userAgent ?? USER_AGENT,
       timeoutMs: options.timeoutMs ?? 60_000,
       allowedOrigins: [endpoints.apiBase, endpoints.oauth.authorizeUrl, endpoints.oauth.loginUrl, endpoints.oauth.tokenUrl, endpoints.oauth.redirectUri],
+      log,
     });
     log.info(`logging in to ${new URL(endpoints.apiBase).host} as ${options.email}`);
     const token = await login(http, endpoints.oauth, options.email, options.otpCode, log);
@@ -169,6 +170,7 @@ async function signPrepared(
       timeoutMs: options.timeoutMs ?? 60_000,
       allowedOrigins: [options.timestampUrl],
       allowHttp: true,
+      log,
     });
     timestamp = await fetchTimestamp(tsaHttp, options.timestampUrl, signature, log);
     log.debug(`timestamped at ${timestamp.genTime.toISOString()} by ${oneLineName(timestamp.tsa.x509.subject)}`);

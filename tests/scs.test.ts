@@ -76,7 +76,8 @@ test('runTask follows atom:links until the result, honouring ping-after and bear
       res.end();
     }
   }, async (base) => {
-    const http = new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [base] });
+    // retries off: this asserts the exact request sequence, which a repeated attempt would change.
+    const http = new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [base], retries: 0 });
     const { body, contentType } = await runTask({ http, apiBase: base, token: 'tok', log: silentLogger }, `${base}/card/v1/cards/tasks`, { method: 'POST' });
     assert.equal(contentType, 'application/json');
     assert.equal(body.toString(), '[{"cardno":"42"}]');
@@ -107,7 +108,8 @@ test('runTask surfaces failed tasks, HTTP errors, foreign links and poll limits'
       res.end('"done"');
     }
   }, async (base) => {
-    const http = new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [base] });
+    // retries off: these assert how a definitive failure surfaces, not how a blip is absorbed.
+    const http = new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [base], retries: 0 });
     const client = { http, apiBase: base, token: 't', log: silentLogger, pollLimit: 3 };
     await assert.rejects(runTask(client, `${base}/failed`, { method: 'POST' }), /rejected the task: .*no can do/);
     await assert.rejects(runTask(client, `${base}/http500`, { method: 'POST' }), /HTTP 500/);

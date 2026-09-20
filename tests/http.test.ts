@@ -107,7 +107,79 @@ test('follow() walks redirects by hand: same origin, hop limit, POST→GET, cook
 
 test('a hanging server hits the timeout with a redacted error', async () => {
   await withServer(() => undefined, async (base) => {
-    const http = new HttpClient({ userAgent: 'test', timeoutMs: 200, allowedOrigins: [base] });
+    const http = new HttpClient({ userAgent: 'test', timeoutMs: 200, allowedOrigins: [base], retries: 0 });
     await assert.rejects(http.fetch(`${base}/hang?secret=1`), (err: unknown) => err instanceof HttpError && /timed out/.test(err.message) && !err.message.includes('secret'));
   });
+});
+
+test('a dropped connection and a 5xx are retried, replaying the method and the body', async () => {
+  const seen: string[] = [];
+  await withServer(
+    (req, res, body) => {
+      seen.push(`${req.method} ${body}`);
+      if (seen.length === 1) return void req.socket.destroy();
+      if (seen.length === 2) {
+        res.writeHead(503, { 'retry-after': '0' });
+        return void res.end('busy');
+      }
+      res.writeHead(200);
+      res.end('ok');
+    },
+    async (base) => {
+      const http = new HttpClient({ userAgent: 'test', timeoutMs: 2000, allowedOrigins: [base], retryBackoffMs: 1 });
+      const response = await http.fetch(base, { method: 'POST', body: 'payload' });
+      assert.equal(response.status, 200);
+      assert.equal(response.body.toString(), 'ok');
+      assert.deepEqual(seen, ['POST payload', 'POST payload', 'POST payload'], 'every attempt must carry the same request');
+    },
+  );
+});
+
+test('without Retry-After the wait comes from the backoff, not from zero', async () => {
+  let hits = 0;
+  await withServer(
+    (_req, res) => {
+      hits += 1;
+      res.writeHead(hits === 1 ? 500 : 200);
+      res.end('x');
+    },
+    async (base) => {
+      const http = new HttpClient({ userAgent: 'test', timeoutMs: 2000, allowedOrigins: [base], retryBackoffMs: 60 });
+      const started = Date.now();
+      assert.equal((await http.fetch(base)).status, 200);
+      assert.ok(Date.now() - started >= 50, 'the retry must wait out the backoff');
+    },
+  );
+});
+
+test('a 4xx is a real answer, and retries are bounded', async () => {
+  let hits = 0;
+  await withServer(
+    (_req, res) => {
+      hits += 1;
+      res.writeHead(403);
+      res.end('no');
+    },
+    async (base) => {
+      const http = new HttpClient({ userAgent: 'test', timeoutMs: 2000, allowedOrigins: [base], retryBackoffMs: 1 });
+      assert.equal((await http.fetch(base)).status, 403);
+      assert.equal(hits, 1, 'a 4xx must not be retried');
+    },
+  );
+
+  let drops = 0;
+  await withServer(
+    (req) => {
+      drops += 1;
+      req.socket.destroy();
+    },
+    async (base) => {
+      const http = new HttpClient({ userAgent: 'test', timeoutMs: 2000, allowedOrigins: [base], retryBackoffMs: 1 });
+      await assert.rejects(http.fetch(`${base}/x?secret=1`), (err: unknown) => err instanceof HttpError && !err.message.includes('secret'));
+      assert.equal(drops, 3, 'the default is one attempt plus two retries');
+      const once = new HttpClient({ userAgent: 'test', timeoutMs: 2000, allowedOrigins: [base], retries: 0 });
+      await assert.rejects(once.fetch(base), HttpError);
+      assert.equal(drops, 4);
+    },
+  );
 });

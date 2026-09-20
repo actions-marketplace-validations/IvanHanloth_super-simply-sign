@@ -22083,48 +22083,6 @@ var import_node_crypto12 = require("node:crypto");
 var import_promises2 = require("node:fs/promises");
 var import_node_path2 = __toESM(require("node:path"), 1);
 
-// src/fsutil.ts
-var import_node_crypto = require("node:crypto");
-var import_promises = require("node:fs/promises");
-var import_node_path = __toESM(require("node:path"), 1);
-async function writeFileAtomic(target, data) {
-  const dir = import_node_path.default.dirname(target);
-  const temp = import_node_path.default.join(dir, `.${import_node_path.default.basename(target)}.${process.pid}.${(0, import_node_crypto.randomBytes)(6).toString("hex")}.tmp`);
-  let mode;
-  try {
-    mode = (await (0, import_promises.stat)(target)).mode & 511;
-  } catch {
-  }
-  const handle = await (0, import_promises.open)(temp, "wx", mode ?? 420);
-  try {
-    await handle.writeFile(data);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    if (mode !== void 0 && process.platform !== "win32") await (0, import_promises.chmod)(temp, mode);
-    await (0, import_promises.rename)(temp, target);
-  } catch (err) {
-    await (0, import_promises.unlink)(temp).catch(() => void 0);
-    throw err;
-  }
-}
-async function writeBackup(original, data) {
-  const backupPath = `${original}.orig`;
-  const handle = await (0, import_promises.open)(backupPath, "wx");
-  try {
-    await handle.writeFile(data);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  return backupPath;
-}
-
-// src/signer.ts
-var import_node_crypto10 = require("node:crypto");
-
 // src/http.ts
 var HttpError = class extends Error {
   status;
@@ -22185,6 +22143,14 @@ var CookieJar = class {
   }
 };
 var REDIRECT_STATUSES = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
+var RETRIABLE_STATUSES = /* @__PURE__ */ new Set([408, 425, 429, 500, 502, 503, 504]);
+function retryAfterMs(headers) {
+  const raw = headers.get("retry-after")?.trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds, 30) * 1e3;
+}
 function describeFetchError(err) {
   if (!(err instanceof Error)) return "unknown error";
   if (err.name === "TimeoutError" || err.name === "AbortError") return "timed out";
@@ -22222,24 +22188,41 @@ var HttpClient2 = class {
     const headers = new Headers(request.headers ?? {});
     headers.set("user-agent", this.#options.userAgent);
     if (!headers.has("accept")) headers.set("accept", "*/*");
-    const cookie = this.jar.header(u.origin);
-    if (cookie) headers.set("cookie", cookie);
-    let response;
-    let body;
-    try {
-      response = await fetch(u, {
-        method: request.method ?? "GET",
-        headers,
-        body: copyBody(request.body),
-        redirect: "manual",
-        signal: AbortSignal.timeout(this.#options.timeoutMs)
-      });
-      body = Buffer.from(await response.arrayBuffer());
-    } catch (err) {
-      throw new HttpError(`request to ${redactUrl(u)} failed: ${describeFetchError(err)}`, u.toString());
+    const retries = this.#options.retries ?? 2;
+    for (let attempt = 0; ; attempt++) {
+      const cookie = this.jar.header(u.origin);
+      if (cookie) headers.set("cookie", cookie);
+      let response;
+      let body;
+      try {
+        response = await fetch(u, {
+          method: request.method ?? "GET",
+          headers,
+          body: copyBody(request.body),
+          redirect: "manual",
+          signal: AbortSignal.timeout(this.#options.timeoutMs)
+        });
+        body = Buffer.from(await response.arrayBuffer());
+      } catch (err) {
+        const failure = `request to ${redactUrl(u)} failed: ${describeFetchError(err)}`;
+        if (attempt >= retries) throw new HttpError(failure, u.toString());
+        await this.#pause(attempt, null, failure);
+        continue;
+      }
+      if (attempt < retries && RETRIABLE_STATUSES.has(response.status)) {
+        await this.#pause(attempt, retryAfterMs(response.headers), `${redactUrl(u)} answered HTTP ${response.status}`);
+        continue;
+      }
+      this.jar.store(u.origin, response.headers.getSetCookie());
+      return { status: response.status, headers: response.headers, url: u.toString(), body };
     }
-    this.jar.store(u.origin, response.headers.getSetCookie());
-    return { status: response.status, headers: response.headers, url: u.toString(), body };
+  }
+  /** Wait out one failed attempt: the delay the server asked for, else exponential backoff with jitter. */
+  async #pause(attempt, serverWaitMs, reason) {
+    const base = this.#options.retryBackoffMs ?? 500;
+    const ms = serverWaitMs ?? Math.round(base * 2 ** attempt * (1 + Math.random()));
+    this.#options.log?.info(`${reason}; retrying in ${ms}ms`);
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
   /** Request and follow redirects by hand (same origins only, bounded, observable). */
   async follow(url, request = {}, options = {}) {
@@ -22292,6 +22275,21 @@ var AuthError = class extends Error {
     this.name = "AuthError";
   }
 };
+var CredentialsRejectedError = class extends AuthError {
+  constructor(message2) {
+    super(message2);
+    this.name = "CredentialsRejectedError";
+  }
+};
+async function withFreshCodeRetry(attempt, canRefreshCode, log) {
+  try {
+    return await attempt(false);
+  } catch (err) {
+    if (!canRefreshCode || !(err instanceof CredentialsRejectedError)) throw err;
+    log.info("the one-time code was refused \u2014 it may already be spent, retrying with the next one");
+    return attempt(true);
+  }
+}
 var ENTITIES = {
   "&amp;": "&",
   "&quot;": '"',
@@ -22363,9 +22361,8 @@ async function login(http, config, email, otpCode, log) {
   }
   if (!found.code) {
     const errorPage = /class=["'][^"']*\berrors?\b[^"']*["']/i.test(result.body.toString("utf8"));
-    throw new AuthError(
-      errorPage ? "login rejected by the identity provider \u2014 wrong e-mail or OTP, or a one-time code that was already used" : `login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`
-    );
+    if (errorPage) throw new CredentialsRejectedError("login rejected by the identity provider \u2014 wrong e-mail or OTP, or a one-time code that was already used");
+    throw new AuthError(`login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`);
   }
   log.secret(found.code);
   log.debug(`authorization code received after ${result.hops.length} redirect(s)`);
@@ -22397,6 +22394,48 @@ async function login(http, config, email, otpCode, log) {
   http.jar.clear();
   return { accessToken, expiresIn: typeof obj["expires_in"] === "number" ? obj["expires_in"] : null };
 }
+
+// src/fsutil.ts
+var import_node_crypto = require("node:crypto");
+var import_promises = require("node:fs/promises");
+var import_node_path = __toESM(require("node:path"), 1);
+async function writeFileAtomic(target, data) {
+  const dir = import_node_path.default.dirname(target);
+  const temp = import_node_path.default.join(dir, `.${import_node_path.default.basename(target)}.${process.pid}.${(0, import_node_crypto.randomBytes)(6).toString("hex")}.tmp`);
+  let mode;
+  try {
+    mode = (await (0, import_promises.stat)(target)).mode & 511;
+  } catch {
+  }
+  const handle = await (0, import_promises.open)(temp, "wx", mode ?? 420);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    if (mode !== void 0 && process.platform !== "win32") await (0, import_promises.chmod)(temp, mode);
+    await (0, import_promises.rename)(temp, target);
+  } catch (err) {
+    await (0, import_promises.unlink)(temp).catch(() => void 0);
+    throw err;
+  }
+}
+async function writeBackup(original, data) {
+  const backupPath = `${original}.orig`;
+  const handle = await (0, import_promises.open)(backupPath, "wx");
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return backupPath;
+}
+
+// src/signer.ts
+var import_node_crypto10 = require("node:crypto");
 
 // src/authenticode.ts
 var import_node_crypto5 = require("node:crypto");
@@ -23961,7 +24000,8 @@ var CloudSession = class _CloudSession {
     const http = new HttpClient2({
       userAgent: options.userAgent ?? USER_AGENT,
       timeoutMs: options.timeoutMs ?? 6e4,
-      allowedOrigins: [endpoints.apiBase, endpoints.oauth.authorizeUrl, endpoints.oauth.loginUrl, endpoints.oauth.tokenUrl, endpoints.oauth.redirectUri]
+      allowedOrigins: [endpoints.apiBase, endpoints.oauth.authorizeUrl, endpoints.oauth.loginUrl, endpoints.oauth.tokenUrl, endpoints.oauth.redirectUri],
+      log
     });
     log.info(`logging in to ${new URL(endpoints.apiBase).host} as ${options.email}`);
     const token = await login(http, endpoints.oauth, options.email, options.otpCode, log);
@@ -23998,7 +24038,8 @@ async function signPrepared(session, prepared, options, log) {
       userAgent: options.userAgent ?? USER_AGENT,
       timeoutMs: options.timeoutMs ?? 6e4,
       allowedOrigins: [options.timestampUrl],
-      allowHttp: true
+      allowHttp: true,
+      log
     });
     timestamp = await fetchTimestamp(tsaHttp, options.timestampUrl, signature, log);
     log.debug(`timestamped at ${timestamp.genTime.toISOString()} by ${oneLineName(timestamp.tsa.x509.subject)}`);
@@ -24174,7 +24215,7 @@ var actionLogger = {
   }
 };
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function resolveOtpCode(inputs) {
+async function resolveOtpCode(inputs, nextWindow = false) {
   if (inputs.otpSeed && inputs.otpCode) throw new Error("set only one of otp-seed and otp-code");
   if (!inputs.otpSeed && !inputs.otpCode) throw new Error("authentication required: set otp-seed (TOTP seed) or otp-code (a current 6-digit code)");
   if (inputs.otpCode) {
@@ -24186,7 +24227,7 @@ async function resolveOtpCode(inputs) {
   const params = parseTotpSecret(inputs.otpSeed);
   try {
     const left = secondsLeftInWindow(params);
-    if (left < 4) {
+    if (nextWindow || left < 4) {
       info(`waiting ${left}s for the next one-time-code window`);
       await sleep2(left * 1e3 + 250);
     }
@@ -24196,6 +24237,19 @@ async function resolveOtpCode(inputs) {
   } finally {
     wipe(params.secret);
   }
+}
+async function openSession(inputs) {
+  return withFreshCodeRetry(
+    async (nextWindow) => CloudSession.open({
+      email: inputs.email,
+      otpCode: await resolveOtpCode(inputs, nextWindow),
+      cardSerial: inputs.cardSerial || void 0,
+      userAgent: USER_AGENT,
+      log: actionLogger
+    }),
+    Boolean(inputs.otpSeed),
+    actionLogger
+  );
 }
 function guardEvent(inputs) {
   const event = process.env["GITHUB_EVENT_NAME"] ?? "";
@@ -24245,14 +24299,7 @@ async function run() {
   }
   const extraCertificates = await loadChain(inputs.chainFile);
   info(`${files.length} file(s) to sign`);
-  const otpCode = await resolveOtpCode(inputs);
-  const session = await CloudSession.open({
-    email: inputs.email,
-    otpCode,
-    cardSerial: inputs.cardSerial || void 0,
-    userAgent: USER_AGENT,
-    log: actionLogger
-  });
+  const session = await openSession(inputs);
   const cert = session.certificate.x509;
   setOutput("certificate-subject", oneLineName(cert.subject));
   setOutput("certificate-fingerprint", cert.fingerprint256);

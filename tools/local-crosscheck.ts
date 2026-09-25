@@ -14,8 +14,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { consoleLogger } from '../src/log.ts';
-import { CloudSession, signPe } from '../src/signer.ts';
-import { verifySignedPe } from '../src/verify.ts';
+import { CloudSession, signFile } from '../src/signer.ts';
+import { verifySignedFile } from '../src/verify.ts';
 import { parseCertificate } from '../src/x509.ts';
 import { OID_EKU_CODE_SIGNING, OID_EKU_TIME_STAMPING, makeCertificate } from '../tests/helpers/mini-x509.ts';
 import { startMockCertum } from '../tests/helpers/mock-certum.ts';
@@ -33,7 +33,7 @@ const mock = await startMockCertum({ email: 'me@example.com', acceptCode: () => 
 try {
   const log = consoleLogger(true);
   const session = await CloudSession.open({ email: 'me@example.com', otpCode: '123456', endpoints: mock.endpoints, log });
-  const result = await signPe(session, readFileSync(input), {
+  const result = await signFile(session, readFileSync(input), {
     description: 'SSS local cross-check',
     url: 'https://example.com/sss',
     timestampUrl: tsaUrl || null,
@@ -43,7 +43,7 @@ try {
   mkdirSync(path.dirname(output), { recursive: true });
   writeFileSync(output, result.signed);
   writeFileSync(`${output}.ca.cer`, ca.der);
-  const verified = verifySignedPe(readFileSync(output));
+  const verified = verifySignedFile(readFileSync(output));
   const stamp = verified.timestamp ? `${verified.timestamp.genTime.toISOString()} by ${verified.timestamp.tsa.x509.subject.split('\n').join(', ')}` : 'none';
   console.log(`written ${output}: ${result.signed.length} bytes; certificates embedded: ${verified.certificates.length}; timestamp: ${stamp}`);
 } finally {

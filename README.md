@@ -48,7 +48,7 @@ flowchart LR
 
 | ✅ Does | ❌ Does not |
 | --- | --- |
-| Authenticode-sign **PE** images: `.exe`, `.dll`, `.sys`, `.ocx`, `.cpl`, … | **MSI / MSP / MSM**, CAB, `.cat`, PowerShell scripts, APPX/MSIX |
+| Authenticode-sign **PE** images (`.exe`, `.dll`, `.sys`, `.ocx`, `.cpl`, …) and **MSI** packages (`.msi`, `.msm`, `.msp`), detected by content | CAB, `.cat`, PowerShell scripts, APPX/MSIX |
 | Embed the **full chain** (leaf + *Certum Code Signing 2021 CA*) | Dual SHA-1 + SHA-256 signatures (SHA-256 only) |
 | Add an **RFC 3161 timestamp** (`time.certum.pl`), verified before it is embedded | Sign with anything but a **Certum SimplySign** cloud certificate |
 | Sign many files on **one login**, on Linux, macOS or Windows runners | Cards that require a **PIN** (the HTTPS flow cannot supply one) |
@@ -97,7 +97,7 @@ or `backup: true` to keep `<file>.orig`.
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `files` | yes | — | Glob patterns, one per line (or comma-separated). PE images only. |
+| `files` | yes | — | Glob patterns, one per line (or comma-separated). PE images and MSI packages, told apart by their contents. |
 | `email` | yes* | `$CERTUM_EMAIL` | Certum account e-mail. |
 | `otp-seed` | one of | `$CERTUM_OTP` | TOTP seed of the SimplySign authenticator — base32 or full `otpauth://` URI. **Long-lived secret.** |
 | `otp-code` | one of | `$CERTUM_TOKEN` | A *current* 6-digit code, for a one-off run without handing the seed to CI. |
@@ -197,9 +197,11 @@ re-implemented in TypeScript on Node 24:
    provider (e-mail + code as the password) → bearer token, valid ~30 min,
    kept in memory only.
 3. **Card**: list cards, fetch the signing certificate (PEM, kept verbatim).
-4. **Digest**: the Authenticode SHA-256 of the PE, computed per Microsoft's
-   specification (headers, sections in file order, trailing data), plus the
-   signed attributes; what the HSM signs is the SHA-256 of those attributes.
+4. **Digest**: the Authenticode SHA-256 of the file — for a PE per Microsoft's
+   specification (headers, sections in file order, trailing data); for an MSI
+   a walk over the compound file's streams plus a digest of its directory
+   metadata (`\x05MsiDigitalSignatureEx`) — plus the signed attributes; what
+   the HSM signs is the SHA-256 of those attributes.
 5. **Sign**: one async task per file → RSA-4096 PKCS#1 v1.5 signature,
    verified against the certificate before anything else happens.
 6. **Timestamp**: RFC 3161 request with a nonce; the token is accepted only if
@@ -207,7 +209,8 @@ re-implemented in TypeScript on Node 24:
    certificate it carries, and that certificate is a time-stamping one.
 7. **Assemble**: PKCS#7 SignedData with the leaf + intermediate, the
    timestamp as an unauthenticated attribute, spliced into the PE's
-   certificate table; PE checksum updated.
+   certificate table (PE checksum updated) or written as the MSI's
+   `\x05DigitalSignature` stream.
 8. **Verify and write**: the signed image is parsed and verified again, then
    written atomically.
 
@@ -290,7 +293,7 @@ npm run check      # typecheck + tests (which build dist/ first)
 
 | ✅ 支持 | ❌ 不支持 |
 | --- | --- |
-| 对 **PE** 文件做 Authenticode 签名：`.exe`、`.dll`、`.sys`、`.ocx`、`.cpl` … | **MSI / MSP / MSM**、CAB、`.cat`、PowerShell 脚本、APPX/MSIX |
+| 对 **PE** 文件（`.exe`、`.dll`、`.sys`、`.ocx`、`.cpl` …）和 **MSI** 安装包（`.msi`、`.msm`、`.msp`）做 Authenticode 签名，按内容识别格式 | CAB、`.cat`、PowerShell 脚本、APPX/MSIX |
 | 嵌入**完整证书链**（叶证书 + *Certum Code Signing 2021 CA*） | SHA-1 + SHA-256 双签名（仅 SHA-256） |
 | 添加 **RFC 3161 时间戳**（`time.certum.pl`），嵌入前先验证 | 非 **Certum SimplySign** 云证书 |
 | **一次登录**签多个文件，Linux / macOS / Windows runner 均可 | 需要 **PIN** 的卡（HTTPS 流程无法输入 PIN） |
@@ -334,7 +337,7 @@ jobs:
 
 | 输入 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `files` | 是 | — | glob 模式，每行一个（或逗号分隔）。仅 PE 文件。 |
+| `files` | 是 | — | glob 模式，每行一个（或逗号分隔）。PE 文件和 MSI 安装包，按内容区分。 |
 | `email` | 是* | `$CERTUM_EMAIL` | Certum 账户邮箱。 |
 | `otp-seed` | 二选一 | `$CERTUM_OTP` | SimplySign 验证器的 TOTP 种子：base32 或完整 `otpauth://` URI。**长期有效的秘密。** |
 | `otp-code` | 二选一 | `$CERTUM_TOKEN` | 验证器上**当前**的 6 位码，用于一次性手动签名，不把种子交给 CI。 |

@@ -63,8 +63,8 @@ test('end to end: login once, sign two images, timestamp, embed the chain, self-
     assert.equal(mock.accessTokens.length, 1, 'one login for the whole batch');
     assert.equal(mock.signedDigests.length, 2);
     assert.ok(mock.signedDigests.every((d) => /^[0-9a-f]{64}$/.test(d)), 'the cloud only ever sees SHA-256 digests');
-    assert.notEqual(mock.signedDigests[0], results[0]!.peHash.toString('hex'), 'the HSM signs the signed-attributes digest, never the raw file hash');
-    assert.notEqual(results[0]!.peHash.toString('hex'), results[1]!.peHash.toString('hex'));
+    assert.notEqual(mock.signedDigests[0], results[0]!.digest.toString('hex'), 'the HSM signs the signed-attributes digest, never the raw file hash');
+    assert.notEqual(results[0]!.digest.toString('hex'), results[1]!.digest.toString('hex'));
     assert.ok(log.secrets.length >= 3, 'token, code and cookie were registered as secrets');
     assert.ok(log.secrets.includes('1234567890'), 'the card serial is masked too');
   });
@@ -90,7 +90,7 @@ test('an existing signature is only replaced on request', async () => {
     const first = await signPe(session, hello, { timestampUrl: null });
     await assert.rejects(signPe(session, first.signed, { timestampUrl: null }), (err: unknown) => err instanceof SignError && /already carries a signature/.test(err.message));
     const second = await signPe(session, first.signed, { timestampUrl: null, replaceExistingSignature: true });
-    assert.equal(second.peHash.toString('hex'), first.peHash.toString('hex'));
+    assert.equal(second.digest.toString('hex'), first.digest.toString('hex'));
     assert.equal(verifySignedPe(second.signed).certificates.length, 1);
     assert.equal(mock.signedDigests.length, 2);
   });

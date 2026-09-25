@@ -17473,9 +17473,9 @@ var require_receiver = __commonJS({
               return callback();
             }
             const buffer = this.consume(8);
-            const upper = buffer.readUInt32BE(0);
+            const upper2 = buffer.readUInt32BE(0);
             const lower = buffer.readUInt32BE(4);
-            if (upper !== 0 || lower > 2 ** 31 - 1) {
+            if (upper2 !== 0 || lower > 2 ** 31 - 1) {
               failWebsocketConnection(this.ws, "Received payload length > 2^31 bytes.");
               return;
             }
@@ -22079,51 +22079,9 @@ function create(patterns, options) {
 }
 
 // src/main.ts
-var import_node_crypto11 = require("node:crypto");
+var import_node_crypto12 = require("node:crypto");
 var import_promises2 = require("node:fs/promises");
 var import_node_path2 = __toESM(require("node:path"), 1);
-
-// src/fsutil.ts
-var import_node_crypto = require("node:crypto");
-var import_promises = require("node:fs/promises");
-var import_node_path = __toESM(require("node:path"), 1);
-async function writeFileAtomic(target, data) {
-  const dir = import_node_path.default.dirname(target);
-  const temp = import_node_path.default.join(dir, `.${import_node_path.default.basename(target)}.${process.pid}.${(0, import_node_crypto.randomBytes)(6).toString("hex")}.tmp`);
-  let mode;
-  try {
-    mode = (await (0, import_promises.stat)(target)).mode & 511;
-  } catch {
-  }
-  const handle = await (0, import_promises.open)(temp, "wx", mode ?? 420);
-  try {
-    await handle.writeFile(data);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    if (mode !== void 0 && process.platform !== "win32") await (0, import_promises.chmod)(temp, mode);
-    await (0, import_promises.rename)(temp, target);
-  } catch (err) {
-    await (0, import_promises.unlink)(temp).catch(() => void 0);
-    throw err;
-  }
-}
-async function writeBackup(original, data) {
-  const backupPath = `${original}.orig`;
-  const handle = await (0, import_promises.open)(backupPath, "wx");
-  try {
-    await handle.writeFile(data);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  return backupPath;
-}
-
-// src/signer.ts
-var import_node_crypto9 = require("node:crypto");
 
 // src/http.ts
 var HttpError = class extends Error {
@@ -22185,6 +22143,14 @@ var CookieJar = class {
   }
 };
 var REDIRECT_STATUSES = /* @__PURE__ */ new Set([301, 302, 303, 307, 308]);
+var RETRIABLE_STATUSES = /* @__PURE__ */ new Set([408, 425, 429, 500, 502, 503, 504]);
+function retryAfterMs(headers) {
+  const raw = headers.get("retry-after")?.trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds, 30) * 1e3;
+}
 function describeFetchError(err) {
   if (!(err instanceof Error)) return "unknown error";
   if (err.name === "TimeoutError" || err.name === "AbortError") return "timed out";
@@ -22222,24 +22188,41 @@ var HttpClient2 = class {
     const headers = new Headers(request.headers ?? {});
     headers.set("user-agent", this.#options.userAgent);
     if (!headers.has("accept")) headers.set("accept", "*/*");
-    const cookie = this.jar.header(u.origin);
-    if (cookie) headers.set("cookie", cookie);
-    let response;
-    let body;
-    try {
-      response = await fetch(u, {
-        method: request.method ?? "GET",
-        headers,
-        body: copyBody(request.body),
-        redirect: "manual",
-        signal: AbortSignal.timeout(this.#options.timeoutMs)
-      });
-      body = Buffer.from(await response.arrayBuffer());
-    } catch (err) {
-      throw new HttpError(`request to ${redactUrl(u)} failed: ${describeFetchError(err)}`, u.toString());
+    const retries = this.#options.retries ?? 2;
+    for (let attempt = 0; ; attempt++) {
+      const cookie = this.jar.header(u.origin);
+      if (cookie) headers.set("cookie", cookie);
+      let response;
+      let body;
+      try {
+        response = await fetch(u, {
+          method: request.method ?? "GET",
+          headers,
+          body: copyBody(request.body),
+          redirect: "manual",
+          signal: AbortSignal.timeout(this.#options.timeoutMs)
+        });
+        body = Buffer.from(await response.arrayBuffer());
+      } catch (err) {
+        const failure = `request to ${redactUrl(u)} failed: ${describeFetchError(err)}`;
+        if (attempt >= retries) throw new HttpError(failure, u.toString());
+        await this.#pause(attempt, null, failure);
+        continue;
+      }
+      if (attempt < retries && RETRIABLE_STATUSES.has(response.status)) {
+        await this.#pause(attempt, retryAfterMs(response.headers), `${redactUrl(u)} answered HTTP ${response.status}`);
+        continue;
+      }
+      this.jar.store(u.origin, response.headers.getSetCookie());
+      return { status: response.status, headers: response.headers, url: u.toString(), body };
     }
-    this.jar.store(u.origin, response.headers.getSetCookie());
-    return { status: response.status, headers: response.headers, url: u.toString(), body };
+  }
+  /** Wait out one failed attempt: the delay the server asked for, else exponential backoff with jitter. */
+  async #pause(attempt, serverWaitMs, reason) {
+    const base = this.#options.retryBackoffMs ?? 500;
+    const ms = serverWaitMs ?? Math.round(base * 2 ** attempt * (1 + Math.random()));
+    this.#options.log?.info(`${reason}; retrying in ${ms}ms`);
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
   /** Request and follow redirects by hand (same origins only, bounded, observable). */
   async follow(url, request = {}, options = {}) {
@@ -22292,6 +22275,21 @@ var AuthError = class extends Error {
     this.name = "AuthError";
   }
 };
+var CredentialsRejectedError = class extends AuthError {
+  constructor(message2) {
+    super(message2);
+    this.name = "CredentialsRejectedError";
+  }
+};
+async function withFreshCodeRetry(attempt, canRefreshCode, log) {
+  try {
+    return await attempt(false);
+  } catch (err) {
+    if (!canRefreshCode || !(err instanceof CredentialsRejectedError)) throw err;
+    log.info("the one-time code was refused \u2014 it may already be spent, retrying with the next one");
+    return attempt(true);
+  }
+}
 var ENTITIES = {
   "&amp;": "&",
   "&quot;": '"',
@@ -22363,9 +22361,8 @@ async function login(http, config, email, otpCode, log) {
   }
   if (!found.code) {
     const errorPage = /class=["'][^"']*\berrors?\b[^"']*["']/i.test(result.body.toString("utf8"));
-    throw new AuthError(
-      errorPage ? "login rejected by the identity provider \u2014 wrong e-mail or OTP, or a one-time code that was already used" : `login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`
-    );
+    if (errorPage) throw new CredentialsRejectedError("login rejected by the identity provider \u2014 wrong e-mail or OTP, or a one-time code that was already used");
+    throw new AuthError(`login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`);
   }
   log.secret(found.code);
   log.debug(`authorization code received after ${result.hops.length} redirect(s)`);
@@ -22397,6 +22394,48 @@ async function login(http, config, email, otpCode, log) {
   http.jar.clear();
   return { accessToken, expiresIn: typeof obj["expires_in"] === "number" ? obj["expires_in"] : null };
 }
+
+// src/fsutil.ts
+var import_node_crypto = require("node:crypto");
+var import_promises = require("node:fs/promises");
+var import_node_path = __toESM(require("node:path"), 1);
+async function writeFileAtomic(target, data) {
+  const dir = import_node_path.default.dirname(target);
+  const temp = import_node_path.default.join(dir, `.${import_node_path.default.basename(target)}.${process.pid}.${(0, import_node_crypto.randomBytes)(6).toString("hex")}.tmp`);
+  let mode;
+  try {
+    mode = (await (0, import_promises.stat)(target)).mode & 511;
+  } catch {
+  }
+  const handle = await (0, import_promises.open)(temp, "wx", mode ?? 420);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    if (mode !== void 0 && process.platform !== "win32") await (0, import_promises.chmod)(temp, mode);
+    await (0, import_promises.rename)(temp, target);
+  } catch (err) {
+    await (0, import_promises.unlink)(temp).catch(() => void 0);
+    throw err;
+  }
+}
+async function writeBackup(original, data) {
+  const backupPath = `${original}.orig`;
+  const handle = await (0, import_promises.open)(backupPath, "wx");
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return backupPath;
+}
+
+// src/signer.ts
+var import_node_crypto10 = require("node:crypto");
 
 // src/authenticode.ts
 var import_node_crypto5 = require("node:crypto");
@@ -23022,8 +23061,8 @@ function spcPeImageData() {
 function digestInfo(hashOid, hash) {
   return seq(seq(oid(hashOid), nul()), octetString(hash));
 }
-function spcIndirectDataContent(peHash) {
-  const content = concat(spcPeImageData(), digestInfo(OID_SHA256, peHash));
+function spcIndirectData(attribute2, hash) {
+  const content = concat(attribute2, digestInfo(OID_SHA256, hash));
   return { der: tlv(48, content), content };
 }
 function spcSpOpusInfo(description, url) {
@@ -23035,9 +23074,8 @@ function spcSpOpusInfo(description, url) {
   }
   return seq(...parts);
 }
-function prepare(pe, options) {
-  const peHash = authenticodeHash(pe, "sha256");
-  const spc = spcIndirectDataContent(peHash);
+function prepareIndirectData(fileTypeAttribute, digest, options) {
+  const spc = spcIndirectData(fileTypeAttribute, digest);
   const messageDigest = sha256(spc.content);
   const attributes = [
     attribute(OID_CONTENT_TYPE, oid(OID_SPC_INDIRECT_DATA)),
@@ -23047,7 +23085,10 @@ function prepare(pe, options) {
   ];
   if (options.description || options.url) attributes.push(attribute(OID_SPC_SP_OPUS_INFO, spcSpOpusInfo(options.description, options.url)));
   const signedAttrsSet = setOf(attributes);
-  return { peHash, spcIndirectData: spc.der, signedAttrsSet, toBeSigned: sha256(signedAttrsSet) };
+  return { digest, spcIndirectData: spc.der, signedAttrsSet, toBeSigned: sha256(signedAttrsSet) };
+}
+function prepare(pe, options) {
+  return prepareIndirectData(spcPeImageData(), authenticodeHash(pe, "sha256"), options);
 }
 function buildSignedData(prepared, signature, signer, chain, timestampToken) {
   const sha256AlgId = seq(oid(OID_SHA256), nul());
@@ -23061,15 +23102,392 @@ function buildSignedData(prepared, signature, signer, chain, timestampToken) {
   const signedData = seq(integer(1), set(sha256AlgId), contentInfo, certificates, set(signerInfo));
   return seq(oid(OID_PKCS7_SIGNED_DATA), ctx(0, signedData));
 }
-function finalize(pe, prepared, signature, signer, chain, timestampToken) {
-  return embedSignature(pe, buildSignedData(prepared, signature, signer, chain, timestampToken));
-}
 
 // src/certs/certum-code-signing-2021-ca.ts
 var CERTUM_CODE_SIGNING_2021_CA_DER = Buffer.from(
   "MIIGuTCCBKGgAwIBAgIRAJmjgAomVTtlq9xuhKaz6jkwDQYJKoZIhvcNAQEMBQAwgYAxCzAJBgNVBAYTAlBMMSIwIAYDVQQKExlVbml6ZXRvIFRlY2hub2xvZ2llcyBTLkEuMScwJQYDVQQLEx5DZXJ0dW0gQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxJDAiBgNVBAMTG0NlcnR1bSBUcnVzdGVkIE5ldHdvcmsgQ0EgMjAeFw0yMTA1MTkwNTMyMThaFw0zNjA1MTgwNTMyMThaMFYxCzAJBgNVBAYTAlBMMSEwHwYDVQQKExhBc3NlY28gRGF0YSBTeXN0ZW1zIFMuQS4xJDAiBgNVBAMTG0NlcnR1bSBDb2RlIFNpZ25pbmcgMjAyMSBDQTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAJ0jzwQwIzvBRiznM3M+Y116dbq+XE26vest+L7k5n5TeJkgH4Cyk74IL9uP61olRsxsU/WBAElTMNQI/HsE0uCJ3VPLO1UufnY0qDHG7yCnJOvoSNbIbMpT+Cci75scCx7UsKK1fcJo4TXetu4du2vEXa09Tx/bndCBfp47zJNsamzUyD7J1rcNxOw5g6FJg0ImIv7nCeNn3B6gZG28WAwe0mDqLrvU49chyKIc7gvCjan3GH+2eP4mYJASflBTQ3HOs6JGdriSMVoD1lzBJobtYDF4L/GhlLEXWgrVQ9m0pW37KuwYqpY42grp/kSYE4BUQrbLgBMNKRvfhQPskDfZ/5GbTCyvlqPN+0OEDmYGKlVkOMenDO/xtMrMINRJS5SY+jWCi8PRHAVxO0xdx8m2bWL4/ZQ1dp0/JhUpHEpABMc3eKax8GI1F03mSJVV6o/nmmKqDE6TK34eTAgDiBuZJzeEPyR7rq30yOVw2DvetlmWssewAhX+cnSaaBKMEj9O2GgYkPJ16Q5Da1APYO6n/6wpCm1qUOW6Ln1J6tVImDyAB5Xs3+JriasaiJ7P5KpXeiVV/HIsW3ej85A6cGaOEpQA2gotiUqZSkoQUjQ9+hPxDVb/Lqz0tMjp6RuLSKARsVQgETwoNQZ8jCeKwSQHDkpwFndfCceZ/OfCUqjxAgMBAAGjggFVMIIBUTAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTddF1MANt7n6B0yrFu9zzAMsBwzTAfBgNVHSMEGDAWgBS2oVQ5AsOgP46KvPrU+Bym0ToO/TAOBgNVHQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwMwMAYDVR0fBCkwJzAloCOgIYYfaHR0cDovL2NybC5jZXJ0dW0ucGwvY3RuY2EyLmNybDBsBggrBgEFBQcBAQRgMF4wKAYIKwYBBQUHMAGGHGh0dHA6Ly9zdWJjYS5vY3NwLWNlcnR1bS5jb20wMgYIKwYBBQUHMAKGJmh0dHA6Ly9yZXBvc2l0b3J5LmNlcnR1bS5wbC9jdG5jYTIuY2VyMDkGA1UdIAQyMDAwLgYEVR0gADAmMCQGCCsGAQUFBwIBFhhodHRwOi8vd3d3LmNlcnR1bS5wbC9DUFMwDQYJKoZIhvcNAQEMBQADggIBAHWIWA/lj1AomlOfEOxD/PQ7bcmahmJ9l0Q4SZC+j/v09CD2csX8Yl7pmJQETIMEcy0VErSZePdC/eAvSxhd7488x/Cat4ke+AUZZDtfCd8yHZgikGuS8mePCHyAiU2VSXgoQ1MrkMuqxg8S1FALDtHqnizYS1bIMOv8znyJjZQESp9RT+6NH024/IqTRsRwSLrYkbFq4VjNn/KV3Xd8dpmyQiirZdrONoPSlCRxCIi54vQcqKiFLpeBm5S0IoDtLoIe21kSw5tAnWPazS6sgN2oXvFpcVVpMcq0C4x/CLSNe0XckmmGsl9z4UUguAJtf+5gE8GVsEg/ge3jHGTYaZ/MyfujE8hOmKBAUkVa7NMxRSB1EdPFpNIpEn/pSHuSL+kWN/2xQBJaDFPr1AX0qLgkXmcEi6PFnaw5T17UdIInA58rTu3mefNuzUtse4AgYmxEmJDodf8NbVcU6VdjWtz0e58WFZT7tST6EWQmx/OoHPelE77lojq7lpsjhDCzhhp4kfsfszxf9g2hoCtltXhCX6NqsqwTT7xe8LgMkH4hVy8L1h2pqGLT2aNCx7h/F95/QvsTeGGjY7dssMzq/rSshFQKLZ8lPb8hFTmiGDJNyHga5hZ59IGynk08mHhBFM/0MLeBzlAQq1utNjQprztZ5vv/NJy8ua9AGbwkMWkO",
   "base64"
 );
+
+// src/cfb.ts
+var CfbError = class extends Error {
+  constructor(message2) {
+    super(message2);
+    this.name = "CfbError";
+  }
+};
+var CFB_MAGIC = Buffer.from("d0cf11e0a1b11ae1", "hex");
+function isCompoundFile(bytes) {
+  return bytes.length >= 8 && asBuffer(bytes).subarray(0, 8).equals(CFB_MAGIC);
+}
+var FREESECT = 4294967295;
+var ENDOFCHAIN = 4294967294;
+var FATSECT = 4294967293;
+var DIFSECT = 4294967292;
+var MAXREGSECT = 4294967290;
+var NOSTREAM = 4294967295;
+var HEADER_SIZE = 512;
+var MINI_SECTOR_SHIFT = 6;
+var MINI_SECTOR_SIZE = 1 << MINI_SECTOR_SHIFT;
+var MINI_STREAM_CUTOFF = 4096;
+var DIRENT_SIZE = 128;
+var DIFAT_IN_HEADER = 109;
+var MAX_NAME_UNITS = 31;
+var MAX_DEPTH = 64;
+var ENTRY_STORAGE = 1;
+var ENTRY_STREAM = 2;
+var ENTRY_ROOT = 5;
+function utf16le(s) {
+  return Buffer.from(s, "utf16le");
+}
+function makeStream(name, data) {
+  return {
+    name,
+    nameRaw: utf16le(name),
+    type: ENTRY_STREAM,
+    clsid: Buffer.alloc(16),
+    stateBits: 0,
+    creationTime: Buffer.alloc(8),
+    modifiedTime: Buffer.alloc(8),
+    data: Buffer.from(asBuffer(data)),
+    children: []
+  };
+}
+function withChildren(entry, children2) {
+  return { ...entry, children: children2 };
+}
+function parseCompoundFile(bytes) {
+  const b = asBuffer(bytes);
+  if (b.length < HEADER_SIZE || !isCompoundFile(b)) throw new CfbError("not an OLE compound file (bad signature)");
+  const majorVersion = b.readUInt16LE(26);
+  const sectorShift = b.readUInt16LE(30);
+  if (!(majorVersion === 3 && sectorShift === 9 || majorVersion === 4 && sectorShift === 12)) {
+    throw new CfbError(`unsupported compound file version ${majorVersion} / sector shift ${sectorShift}`);
+  }
+  if (b.readUInt16LE(32) !== MINI_SECTOR_SHIFT) throw new CfbError("unsupported mini sector size");
+  const sectorSize = 1 << sectorShift;
+  const entriesPerSector = sectorSize / 4;
+  const numFatSectors = b.readUInt32LE(44);
+  const firstDirSector = b.readUInt32LE(48);
+  const miniCutoff = b.readUInt32LE(56);
+  const firstMiniFatSector = b.readUInt32LE(60);
+  const numMiniFatSectors = b.readUInt32LE(64);
+  const firstDifatSector = b.readUInt32LE(68);
+  const numDifatSectors = b.readUInt32LE(72);
+  const sector = (n) => {
+    if (n > MAXREGSECT) throw new CfbError(`invalid sector number 0x${n.toString(16)}`);
+    const off = (n + 1) * sectorSize;
+    if (off + sectorSize > b.length) throw new CfbError(`sector ${n} lies beyond the end of the file`);
+    return b.subarray(off, off + sectorSize);
+  };
+  const difat = [];
+  for (let i = 0; i < DIFAT_IN_HEADER; i++) {
+    const v = b.readUInt32LE(76 + i * 4);
+    if (v <= MAXREGSECT) difat.push(v);
+  }
+  let ds = firstDifatSector;
+  const seenDifat = /* @__PURE__ */ new Set();
+  for (let i = 0; i < numDifatSectors; i++) {
+    if (ds > MAXREGSECT) break;
+    if (seenDifat.has(ds)) throw new CfbError("cyclic DIFAT chain");
+    seenDifat.add(ds);
+    const s = sector(ds);
+    for (let j = 0; j < entriesPerSector - 1; j++) {
+      const v = s.readUInt32LE(j * 4);
+      if (v <= MAXREGSECT) difat.push(v);
+    }
+    ds = s.readUInt32LE(sectorSize - 4);
+  }
+  if (difat.length < numFatSectors) throw new CfbError("the DIFAT lists fewer FAT sectors than the header announces");
+  const fat = new Uint32Array(numFatSectors * entriesPerSector);
+  for (let i = 0; i < numFatSectors; i++) {
+    const s = sector(difat[i]);
+    for (let j = 0; j < entriesPerSector; j++) fat[i * entriesPerSector + j] = s.readUInt32LE(j * 4);
+  }
+  const chain = (start, table, what) => {
+    const out = [];
+    let cur = start;
+    while (cur <= MAXREGSECT) {
+      if (out.length >= table.length) throw new CfbError(`cyclic sector chain in ${what}`);
+      out.push(cur);
+      if (cur >= table.length) throw new CfbError(`${what} refers to sector ${cur} outside the FAT`);
+      cur = table[cur];
+    }
+    return out;
+  };
+  const readChain = (start, size, what) => {
+    const sectors = chain(start, fat, what);
+    if (size > sectors.length * sectorSize) throw new CfbError(`${what} is longer than its sector chain`);
+    return Buffer.concat(sectors.map(sector)).subarray(0, size);
+  };
+  let miniFat = new Uint32Array(0);
+  if (numMiniFatSectors > 0 && firstMiniFatSector <= MAXREGSECT) {
+    const sectors = chain(firstMiniFatSector, fat, "mini FAT");
+    miniFat = new Uint32Array(sectors.length * entriesPerSector);
+    sectors.forEach((n, i) => {
+      const s = sector(n);
+      for (let j = 0; j < entriesPerSector; j++) miniFat[i * entriesPerSector + j] = s.readUInt32LE(j * 4);
+    });
+  }
+  const dirBytes = Buffer.concat(chain(firstDirSector, fat, "directory").map(sector));
+  const entries = [];
+  for (let off = 0; off + DIRENT_SIZE <= dirBytes.length; off += DIRENT_SIZE) {
+    const e = dirBytes.subarray(off, off + DIRENT_SIZE);
+    const type = e[66];
+    if (type === 0) {
+      entries.push(null);
+      continue;
+    }
+    if (type !== ENTRY_STORAGE && type !== ENTRY_STREAM && type !== ENTRY_ROOT) throw new CfbError(`unknown directory entry type ${type}`);
+    const nameLen = e.readUInt16LE(64);
+    if (nameLen < 2 || nameLen > 64 || nameLen % 2 !== 0) throw new CfbError("directory entry with an invalid name length");
+    const nameRaw = Buffer.from(e.subarray(0, nameLen - 2));
+    const size = majorVersion === 3 ? e.readUInt32LE(120) : Number(e.readBigUInt64LE(120));
+    if (size > b.length) throw new CfbError("directory entry claims a stream larger than the file");
+    entries.push({
+      name: nameRaw.toString("utf16le"),
+      nameRaw,
+      type,
+      left: e.readUInt32LE(68),
+      right: e.readUInt32LE(72),
+      child: e.readUInt32LE(76),
+      clsid: Buffer.from(e.subarray(80, 96)),
+      stateBits: e.readUInt32LE(96),
+      creationTime: Buffer.from(e.subarray(100, 108)),
+      modifiedTime: Buffer.from(e.subarray(108, 116)),
+      start: e.readUInt32LE(116),
+      size
+    });
+  }
+  const rootRaw = entries[0];
+  if (!rootRaw || rootRaw.type !== ENTRY_ROOT) throw new CfbError("the first directory entry is not the root storage");
+  const miniStream = rootRaw.size > 0 ? readChain(rootRaw.start, rootRaw.size, "mini stream") : Buffer.alloc(0);
+  const readMini = (start, size, what) => {
+    const sectors = chain(start, miniFat, what);
+    if (size > sectors.length * MINI_SECTOR_SIZE) throw new CfbError(`${what} is longer than its mini sector chain`);
+    const parts = sectors.map((n) => {
+      const off = n * MINI_SECTOR_SIZE;
+      if (off + MINI_SECTOR_SIZE > miniStream.length) throw new CfbError(`${what} refers to mini sector ${n} beyond the mini stream`);
+      return miniStream.subarray(off, off + MINI_SECTOR_SIZE);
+    });
+    return Buffer.concat(parts).subarray(0, size);
+  };
+  const streamData = (e) => {
+    if (e.size === 0) return Buffer.alloc(0);
+    const what = `stream "${e.name}"`;
+    return Buffer.from(e.size < miniCutoff ? readMini(e.start, e.size, what) : readChain(e.start, e.size, what));
+  };
+  const visited = /* @__PURE__ */ new Set();
+  const siblings = (first) => {
+    const out = [];
+    const stack = [first];
+    while (stack.length > 0) {
+      const i = stack.pop();
+      if (i > MAXREGSECT) continue;
+      if (visited.has(i)) throw new CfbError(`directory entry ${i} is referenced twice`);
+      visited.add(i);
+      const e = entries[i];
+      if (!e) throw new CfbError(`directory tree points at empty entry ${i}`);
+      if (e.type === ENTRY_ROOT) throw new CfbError("the root entry appears inside the tree");
+      out.push(e);
+      stack.push(e.left, e.right);
+    }
+    return out;
+  };
+  const build = (e, depth) => {
+    if (depth > MAX_DEPTH) throw new CfbError("storage nesting is too deep");
+    const isStream = e.type === ENTRY_STREAM;
+    const children2 = isStream ? [] : siblings(e.child).map((c) => build(c, depth + 1));
+    if (isStream && e.child <= MAXREGSECT) throw new CfbError(`stream "${e.name}" has children`);
+    return {
+      name: e.name,
+      nameRaw: e.nameRaw,
+      type: e.type,
+      clsid: e.clsid,
+      stateBits: e.stateBits,
+      creationTime: e.creationTime,
+      modifiedTime: e.modifiedTime,
+      data: isStream ? streamData(e) : Buffer.alloc(0),
+      children: children2
+    };
+  };
+  visited.add(0);
+  return { root: build(rootRaw, 0), majorVersion };
+}
+function upper(unit) {
+  const u = String.fromCharCode(unit).toUpperCase();
+  return u.length === 1 ? u.charCodeAt(0) : unit;
+}
+function treeNameCompare(a, b) {
+  if (a.nameRaw.length !== b.nameRaw.length) return a.nameRaw.length - b.nameRaw.length;
+  for (let i = 0; i < a.nameRaw.length; i += 2) {
+    const d = upper(a.nameRaw.readUInt16LE(i)) - upper(b.nameRaw.readUInt16LE(i));
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+function writeCompoundFile(file) {
+  const sectorShift = file.majorVersion === 4 ? 12 : 9;
+  const sectorSize = 1 << sectorShift;
+  const entriesPerSector = sectorSize / 4;
+  const records = [];
+  const place = (entry, depth) => {
+    if (depth > MAX_DEPTH) throw new CfbError("storage nesting is too deep");
+    if (entry.nameRaw.length > MAX_NAME_UNITS * 2 || entry.nameRaw.length % 2 !== 0) throw new CfbError(`invalid entry name "${entry.name}"`);
+    const id = records.length;
+    records.push({ entry, left: NOSTREAM, right: NOSTREAM, child: NOSTREAM, start: ENDOFCHAIN, size: 0 });
+    if (entry.type !== ENTRY_STREAM) {
+      const kids = [...entry.children].sort(treeNameCompare);
+      for (let i = 1; i < kids.length; i++) {
+        if (treeNameCompare(kids[i - 1], kids[i]) === 0) throw new CfbError(`duplicate entry name "${kids[i].name}"`);
+      }
+      const ids = kids.map((k) => place(k, depth + 1));
+      const tree = (lo, hi) => {
+        if (lo > hi) return NOSTREAM;
+        const mid = lo + hi >> 1;
+        const rec = records[ids[mid]];
+        rec.left = tree(lo, mid - 1);
+        rec.right = tree(mid + 1, hi);
+        return ids[mid];
+      };
+      records[id].child = tree(0, ids.length - 1);
+    } else if (entry.children.length > 0) {
+      throw new CfbError(`stream "${entry.name}" cannot have children`);
+    }
+    return id;
+  };
+  if (file.root.type !== ENTRY_ROOT) throw new CfbError("the root entry must be of type root");
+  place(file.root, 0);
+  const sectors = [];
+  const fat = [];
+  const appendChain = (data) => {
+    if (data.length === 0) return ENDOFCHAIN;
+    const start = sectors.length;
+    const count = Math.ceil(data.length / sectorSize);
+    for (let i = 0; i < count; i++) {
+      const s = Buffer.alloc(sectorSize);
+      data.copy(s, 0, i * sectorSize, Math.min(data.length, (i + 1) * sectorSize));
+      sectors.push(s);
+      fat.push(i < count - 1 ? start + i + 1 : ENDOFCHAIN);
+    }
+    return start;
+  };
+  const miniParts = [];
+  const miniFat = [];
+  for (const rec of records) {
+    if (rec.entry.type !== ENTRY_STREAM) continue;
+    const data = rec.entry.data;
+    rec.size = data.length;
+    if (data.length === 0) {
+      rec.start = ENDOFCHAIN;
+    } else if (data.length < MINI_STREAM_CUTOFF) {
+      const count = Math.ceil(data.length / MINI_SECTOR_SIZE);
+      rec.start = miniFat.length;
+      const padded = Buffer.alloc(count * MINI_SECTOR_SIZE);
+      data.copy(padded);
+      miniParts.push(padded);
+      for (let i = 0; i < count; i++) miniFat.push(i < count - 1 ? miniFat.length + 1 : ENDOFCHAIN);
+    } else {
+      rec.start = appendChain(data);
+    }
+  }
+  const miniStream = Buffer.concat(miniParts);
+  const rootRecord = records[0];
+  rootRecord.start = appendChain(miniStream);
+  rootRecord.size = miniStream.length;
+  const u32s = (values) => {
+    const out = Buffer.alloc(values.length * 4);
+    values.forEach((v, i) => out.writeUInt32LE(v >>> 0, i * 4));
+    return out;
+  };
+  const firstMiniFatSector = appendChain(u32s(miniFat));
+  const numMiniFatSectors = miniFat.length === 0 ? 0 : Math.ceil(miniFat.length * 4 / sectorSize);
+  const numDirSectors = Math.ceil(records.length * DIRENT_SIZE / sectorSize);
+  const dir = Buffer.alloc(numDirSectors * sectorSize);
+  for (let i = 0; i < numDirSectors * sectorSize / DIRENT_SIZE; i++) {
+    const off = i * DIRENT_SIZE;
+    const rec = records[i];
+    if (!rec) {
+      dir.writeUInt32LE(NOSTREAM, off + 68);
+      dir.writeUInt32LE(NOSTREAM, off + 72);
+      dir.writeUInt32LE(NOSTREAM, off + 76);
+      continue;
+    }
+    const e = rec.entry;
+    e.nameRaw.copy(dir, off);
+    dir.writeUInt16LE(e.nameRaw.length + 2, off + 64);
+    dir[off + 66] = e.type;
+    dir[off + 67] = 1;
+    dir.writeUInt32LE(rec.left, off + 68);
+    dir.writeUInt32LE(rec.right, off + 72);
+    dir.writeUInt32LE(rec.child, off + 76);
+    e.clsid.copy(dir, off + 80, 0, 16);
+    dir.writeUInt32LE(e.stateBits >>> 0, off + 96);
+    e.creationTime.copy(dir, off + 100, 0, 8);
+    e.modifiedTime.copy(dir, off + 108, 0, 8);
+    dir.writeUInt32LE(rec.start, off + 116);
+    dir.writeBigUInt64LE(BigInt(rec.size), off + 120);
+  }
+  const firstDirSector = appendChain(dir);
+  const dataSectors = sectors.length;
+  let numFatSectors = 0;
+  let numDifatSectors = 0;
+  for (; ; ) {
+    const total = dataSectors + numFatSectors + numDifatSectors;
+    const needFat = Math.ceil(total / entriesPerSector);
+    const needDifat = needFat > DIFAT_IN_HEADER ? Math.ceil((needFat - DIFAT_IN_HEADER) / (entriesPerSector - 1)) : 0;
+    if (needFat === numFatSectors && needDifat === numDifatSectors) break;
+    numFatSectors = needFat;
+    numDifatSectors = needDifat;
+  }
+  const fatStart = dataSectors;
+  const difatStart = dataSectors + numFatSectors;
+  const fatTable = new Array(numFatSectors * entriesPerSector).fill(FREESECT);
+  fat.forEach((v, i) => fatTable[i] = v);
+  for (let i = 0; i < numFatSectors; i++) fatTable[fatStart + i] = FATSECT;
+  for (let i = 0; i < numDifatSectors; i++) fatTable[difatStart + i] = DIFSECT;
+  const fatSectorNumbers = Array.from({ length: numFatSectors }, (_, i) => fatStart + i);
+  const header = Buffer.alloc(sectorSize);
+  CFB_MAGIC.copy(header, 0);
+  header.writeUInt16LE(62, 24);
+  header.writeUInt16LE(file.majorVersion, 26);
+  header.writeUInt16LE(65534, 28);
+  header.writeUInt16LE(sectorShift, 30);
+  header.writeUInt16LE(MINI_SECTOR_SHIFT, 32);
+  header.writeUInt32LE(file.majorVersion === 4 ? numDirSectors : 0, 40);
+  header.writeUInt32LE(numFatSectors, 44);
+  header.writeUInt32LE(firstDirSector, 48);
+  header.writeUInt32LE(0, 52);
+  header.writeUInt32LE(MINI_STREAM_CUTOFF, 56);
+  header.writeUInt32LE(firstMiniFatSector, 60);
+  header.writeUInt32LE(numMiniFatSectors, 64);
+  header.writeUInt32LE(numDifatSectors > 0 ? difatStart : ENDOFCHAIN, 68);
+  header.writeUInt32LE(numDifatSectors, 72);
+  for (let i = 0; i < DIFAT_IN_HEADER; i++) header.writeUInt32LE(fatSectorNumbers[i] ?? FREESECT, 76 + i * 4);
+  const parts = [header, ...sectors];
+  for (let i = 0; i < numFatSectors; i++) parts.push(u32s(fatTable.slice(i * entriesPerSector, (i + 1) * entriesPerSector)));
+  const perDifat = entriesPerSector - 1;
+  for (let i = 0; i < numDifatSectors; i++) {
+    const slice = fatSectorNumbers.slice(DIFAT_IN_HEADER + i * perDifat, DIFAT_IN_HEADER + (i + 1) * perDifat);
+    while (slice.length < perDifat) slice.push(FREESECT);
+    slice.push(i < numDifatSectors - 1 ? difatStart + i + 1 : ENDOFCHAIN);
+    parts.push(u32s(slice));
+  }
+  return Buffer.concat(parts);
+}
+
+// src/image.ts
+var ImageError = class extends Error {
+  constructor(message2) {
+    super(message2);
+    this.name = "ImageError";
+  }
+};
+function detectImageKind(bytes) {
+  if (bytes.length >= 2 && bytes[0] === 77 && bytes[1] === 90) return "pe";
+  if (isCompoundFile(bytes)) return "msi";
+  throw new ImageError("not a signable file: neither a PE image (MZ) nor an MSI package (OLE compound file)");
+}
 
 // src/log.ts
 var silentLogger = {
@@ -23079,8 +23497,92 @@ var silentLogger = {
   secret: () => void 0
 };
 
-// src/scs.ts
+// src/msi.ts
 var import_node_crypto6 = require("node:crypto");
+var OID_SPC_SIPINFO = "1.3.6.1.4.1.311.2.1.30";
+var DIGITAL_SIGNATURE_STREAM = "DigitalSignature";
+var DIGITAL_SIGNATURE_EX_STREAM = "MsiDigitalSignatureEx";
+var SIP_UUID_MSI = Buffer.from("f1100c0000000000c000000000000046", "hex");
+function spcSipInfo() {
+  const zero = integer(0);
+  return seq(oid(OID_SPC_SIPINFO), seq(integer(2), octetString(SIP_UUID_MSI), zero, zero, zero, zero, zero));
+}
+function hashNameCompare(a, b) {
+  const n = Math.min(a.nameRaw.length, b.nameRaw.length);
+  const d = Buffer.compare(a.nameRaw.subarray(0, n), b.nameRaw.subarray(0, n));
+  return d !== 0 ? d : a.nameRaw.length - b.nameRaw.length;
+}
+var isSignatureStream = (e) => e.name === DIGITAL_SIGNATURE_STREAM || e.name === DIGITAL_SIGNATURE_EX_STREAM;
+var sortedChildren = (e) => [...e.children].sort(hashNameCompare);
+function msiDigest(file, algorithm) {
+  const h = (0, import_node_crypto6.createHash)(algorithm);
+  const walk = (entry, isRoot) => {
+    for (const child of sortedChildren(entry)) {
+      if (isRoot && child.name === DIGITAL_SIGNATURE_STREAM) continue;
+      if (child.type === ENTRY_STREAM) h.update(child.data);
+      else if (child.type === ENTRY_STORAGE) walk(child, false);
+    }
+    h.update(entry.clsid);
+  };
+  walk(file.root, true);
+  return h.digest();
+}
+function msiPrehash(file, algorithm) {
+  const h = (0, import_node_crypto6.createHash)(algorithm);
+  const metadata = (e) => {
+    if (e.type !== ENTRY_ROOT) h.update(e.nameRaw);
+    if (e.type === ENTRY_STREAM) {
+      const size = Buffer.alloc(4);
+      size.writeUInt32LE(e.data.length >>> 0);
+      h.update(size);
+    } else {
+      h.update(e.clsid);
+    }
+    const state = Buffer.alloc(4);
+    state.writeUInt32LE(e.stateBits >>> 0);
+    h.update(state);
+    if (e.type !== ENTRY_ROOT) {
+      h.update(e.creationTime);
+      h.update(e.modifiedTime);
+    }
+  };
+  const walk = (entry, isRoot) => {
+    metadata(entry);
+    for (const child of sortedChildren(entry)) {
+      if (isRoot && isSignatureStream(child)) continue;
+      if (child.type === ENTRY_STREAM) metadata(child);
+      else if (child.type === ENTRY_STORAGE) walk(child, false);
+    }
+  };
+  walk(file.root, true);
+  return h.digest();
+}
+function readMsiSignature(file) {
+  const find = (name) => file.root.children.find((c) => c.name === name && c.type === ENTRY_STREAM);
+  const signature = find(DIGITAL_SIGNATURE_STREAM);
+  if (!signature) return null;
+  const extended = find(DIGITAL_SIGNATURE_EX_STREAM);
+  return { pkcs7: signature.data, extended: extended ? extended.data : null };
+}
+function isMsiSigned(file) {
+  return readMsiSignature(file) !== null;
+}
+function stripMsiSignature(file) {
+  return { ...file, root: withChildren(file.root, file.root.children.filter((c) => !isSignatureStream(c))) };
+}
+function withExtendedSignature(file, extended) {
+  const stripped = stripMsiSignature(file);
+  return { ...stripped, root: withChildren(stripped.root, [...stripped.root.children, makeStream(DIGITAL_SIGNATURE_EX_STREAM, extended)]) };
+}
+function embedMsiSignature(file, pkcs7, extended) {
+  const stripped = stripMsiSignature(file);
+  const streams = [makeStream(DIGITAL_SIGNATURE_STREAM, pkcs7)];
+  if (extended) streams.push(makeStream(DIGITAL_SIGNATURE_EX_STREAM, extended));
+  return { ...stripped, root: withChildren(stripped.root, [...stripped.root.children, ...streams]) };
+}
+
+// src/scs.ts
+var import_node_crypto7 = require("node:crypto");
 var ScsError = class extends Error {
   constructor(message2) {
     super(message2);
@@ -23171,7 +23673,7 @@ function multipartPart(body, name) {
   throw new ScsError(`multipart part "${name}" not found`);
 }
 function buildMultipart(parts) {
-  const boundary = `----SuperSimplySign${(0, import_node_crypto6.randomBytes)(16).toString("hex")}`;
+  const boundary = `----SuperSimplySign${(0, import_node_crypto7.randomBytes)(16).toString("hex")}`;
   const chunks = [];
   for (const part of parts) {
     const filename = part.filename ? `; filename="${part.filename}"` : "";
@@ -23250,7 +23752,7 @@ function parseSignatureResponse(body, digestHex) {
 }
 
 // src/timestamp.ts
-var import_node_crypto7 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 var TimestampError = class extends Error {
   constructor(message2) {
     super(message2);
@@ -23334,8 +23836,8 @@ function verifyTimestampToken(token, expected) {
   return { token: Buffer.from(token), genTime, serialNumber, policy, tsa };
 }
 async function fetchTimestamp(http, url, signature, log) {
-  const imprint = (0, import_node_crypto7.createHash)("sha256").update(signature).digest();
-  const nonce = (0, import_node_crypto7.randomBytes)(8);
+  const imprint = (0, import_node_crypto8.createHash)("sha256").update(signature).digest();
+  const nonce = (0, import_node_crypto8.randomBytes)(8);
   const response = await http.fetch(url, {
     method: "POST",
     headers: { "content-type": "application/timestamp-query", accept: "application/timestamp-reply" },
@@ -23348,7 +23850,7 @@ async function fetchTimestamp(http, url, signature, log) {
 }
 
 // src/verify.ts
-var import_node_crypto8 = require("node:crypto");
+var import_node_crypto9 = require("node:crypto");
 var VerificationError = class extends Error {
   constructor(message2) {
     super(message2);
@@ -23372,29 +23874,23 @@ function parseOpusInfo(t) {
   }
   return { description, url };
 }
-function verifySignedPe(pe) {
-  let entries;
-  try {
-    entries = readCertificateTable(pe);
-  } catch (err) {
-    throw new VerificationError(`cannot read the certificate table: ${message(err)}`);
-  }
-  const entry = entries.find((e) => e.type === WIN_CERT_TYPE_PKCS_SIGNED_DATA);
-  if (!entry) throw new VerificationError("the file carries no Authenticode signature");
+function verifySignedData(kind, pkcs7, expectedType, computeDigest) {
   let sd;
   let spc;
   try {
-    sd = parseSignedData(readTlv(entry.data, 0).raw);
+    sd = parseSignedData(readTlv(pkcs7, 0).raw);
     if (sd.eContentType !== OID_SPC_INDIRECT_DATA || !sd.eContent) throw new CmsError("the signature does not wrap an SpcIndirectDataContent");
     spc = children(expectTag(sd.eContent, 48, "SpcIndirectDataContent"));
   } catch (err) {
     throw new VerificationError(`malformed signature: ${message(err)}`);
   }
+  const attributeType = decodeOid(expectTag(children(expectTag(spc[0], 48, "SpcAttributeTypeAndOptionalValue"))[0], 6, "type"));
+  if (attributeType !== expectedType) throw new VerificationError(`the signature is for a different file type (SpcAttributeType ${attributeType})`);
   const digestInfo2 = children(expectTag(spc[1], 48, "DigestInfo"));
   const hashAlgorithm = hashNameForOid(parseAlgorithmIdentifier(digestInfo2[0]).oid);
   const embeddedHash = octets(digestInfo2[1], "DigestInfo.digest");
-  const peHash = authenticodeHash(pe, hashAlgorithm);
-  if (!bytesEqual(embeddedHash, peHash)) {
+  const digest = computeDigest(hashAlgorithm);
+  if (!bytesEqual(embeddedHash, digest)) {
     throw new VerificationError(`Authenticode ${hashAlgorithm} digest mismatch \u2014 the signature does not match the file contents`);
   }
   const signerInfo = sd.signerInfos[0];
@@ -23414,15 +23910,16 @@ function verifySignedPe(pe) {
   const tokenAttr = findAttribute(signerInfo.unsignedAttributes, OID_RFC3161_COUNTER_SIGN);
   if (tokenAttr) {
     try {
-      timestamp = verifyTimestampToken(tokenAttr.raw, { imprint: (0, import_node_crypto8.createHash)("sha256").update(signerInfo.signature).digest(), nonce: null });
+      timestamp = verifyTimestampToken(tokenAttr.raw, { imprint: (0, import_node_crypto9.createHash)("sha256").update(signerInfo.signature).digest(), nonce: null });
     } catch (err) {
       if (err instanceof TimestampError) throw new VerificationError(`invalid timestamp: ${err.message}`);
       throw err;
     }
   }
   return {
+    kind,
     hashAlgorithm,
-    peHash,
+    digest,
     signer,
     certificates: sd.certificates,
     signingTime: signingTimeAttr ? decodeTime(signingTimeAttr) : null,
@@ -23430,6 +23927,33 @@ function verifySignedPe(pe) {
     url,
     timestamp
   };
+}
+function verifySignedPe(pe) {
+  let entries;
+  try {
+    entries = readCertificateTable(pe);
+  } catch (err) {
+    throw new VerificationError(`cannot read the certificate table: ${message(err)}`);
+  }
+  const entry = entries.find((e) => e.type === WIN_CERT_TYPE_PKCS_SIGNED_DATA);
+  if (!entry) throw new VerificationError("the file carries no Authenticode signature");
+  return verifySignedData("pe", entry.data, OID_SPC_PE_IMAGE_DATA, (algorithm) => authenticodeHash(pe, algorithm));
+}
+function verifySignedMsi(bytes) {
+  let file;
+  try {
+    file = parseCompoundFile(bytes);
+  } catch (err) {
+    throw new VerificationError(`cannot read the package: ${message(err)}`);
+  }
+  const signature = readMsiSignature(file);
+  if (!signature) throw new VerificationError("the file carries no Authenticode signature");
+  return verifySignedData("msi", signature.pkcs7, OID_SPC_SIPINFO, (algorithm) => {
+    if (signature.extended && !bytesEqual(msiPrehash(file, algorithm), signature.extended)) {
+      throw new VerificationError("the MsiDigitalSignatureEx stream does not match the package metadata (names, CLSIDs, sizes or times changed)");
+    }
+    return msiDigest(file, algorithm);
+  });
 }
 
 // src/signer.ts
@@ -23476,7 +24000,8 @@ var CloudSession = class _CloudSession {
     const http = new HttpClient2({
       userAgent: options.userAgent ?? USER_AGENT,
       timeoutMs: options.timeoutMs ?? 6e4,
-      allowedOrigins: [endpoints.apiBase, endpoints.oauth.authorizeUrl, endpoints.oauth.loginUrl, endpoints.oauth.tokenUrl, endpoints.oauth.redirectUri]
+      allowedOrigins: [endpoints.apiBase, endpoints.oauth.authorizeUrl, endpoints.oauth.loginUrl, endpoints.oauth.tokenUrl, endpoints.oauth.redirectUri],
+      log
     });
     log.info(`logging in to ${new URL(endpoints.apiBase).host} as ${options.email}`);
     const token = await login(http, endpoints.oauth, options.email, options.otpCode, log);
@@ -23501,18 +24026,10 @@ var CloudSession = class _CloudSession {
     return requestSignature(this.#scs, this.card, digest);
   }
 };
-async function signPe(session, pe, options = {}) {
-  const log = options.log ?? silentLogger;
-  let image = asBuffer(pe);
-  if (parsePeLayout(image).certTableSize !== 0) {
-    if (!options.replaceExistingSignature) throw new SignError("the file already carries a signature (enable replace-existing-signature to replace it)");
-    log.info("replacing the existing signature");
-    image = stripSignature(image);
-  }
-  const prepared = prepare(image, { description: options.description, url: options.url, signingTime: options.signingTime ?? /* @__PURE__ */ new Date() });
-  log.debug(`authenticode sha256 ${prepared.peHash.toString("hex")}`);
+async function signPrepared(session, prepared, options, log) {
+  log.debug(`authenticode sha256 ${prepared.digest.toString("hex")}`);
   const signature = await session.signDigest(prepared.toBeSigned);
-  if (!(0, import_node_crypto9.verify)("sha256", prepared.signedAttrsSet, session.certificate.x509.publicKey, signature)) {
+  if (!(0, import_node_crypto10.verify)("sha256", prepared.signedAttrsSet, session.certificate.x509.publicKey, signature)) {
     throw new SignError("the cloud returned a signature that does not verify with the signing certificate \u2014 refusing to embed it");
   }
   let timestamp = null;
@@ -23521,27 +24038,69 @@ async function signPe(session, pe, options = {}) {
       userAgent: options.userAgent ?? USER_AGENT,
       timeoutMs: options.timeoutMs ?? 6e4,
       allowedOrigins: [options.timestampUrl],
-      allowHttp: true
+      allowHttp: true,
+      log
     });
     timestamp = await fetchTimestamp(tsaHttp, options.timestampUrl, signature, log);
     log.debug(`timestamped at ${timestamp.genTime.toISOString()} by ${oneLineName(timestamp.tsa.x509.subject)}`);
   }
   const { chain, missingIssuer } = buildChain(session.certificate, [...options.extraCertificates ?? [], CERTUM_INTERMEDIATE]);
   if (missingIssuer) log.warning(`no certificate for issuer "${missingIssuer}" is available to embed; verifiers will have to obtain it themselves`);
-  const signed = finalize(image, prepared, signature, session.certificate, chain, timestamp?.token ?? null);
+  const pkcs7 = buildSignedData(prepared, signature, session.certificate, chain, timestamp?.token ?? null);
+  return { pkcs7, signature, timestamp, chain };
+}
+function checkSelfVerification(session, verification, prepared, timestamp) {
+  if (verification.signer.x509.fingerprint256 !== session.certificate.x509.fingerprint256) {
+    throw new SignError("self-verification found a different signer certificate than the session certificate");
+  }
+  if (!verification.digest.equals(prepared.digest)) throw new SignError("self-verification recomputed a different file digest than the one that was signed");
+  if (timestamp && !verification.timestamp) throw new SignError("self-verification could not find the embedded timestamp");
+}
+var alreadySigned = (options, log) => {
+  if (!options.replaceExistingSignature) throw new SignError("the file already carries a signature (enable replace-existing-signature to replace it)");
+  log.info("replacing the existing signature");
+};
+async function signPe(session, pe, options = {}) {
+  const log = options.log ?? silentLogger;
+  let image = asBuffer(pe);
+  if (parsePeLayout(image).certTableSize !== 0) {
+    alreadySigned(options, log);
+    image = stripSignature(image);
+  }
+  const prepared = prepare(image, { description: options.description, url: options.url, signingTime: options.signingTime ?? /* @__PURE__ */ new Date() });
+  const { pkcs7, signature, timestamp, chain } = await signPrepared(session, prepared, options, log);
+  const signed = embedSignature(image, pkcs7);
   let verification = null;
   if (options.verify !== false) {
     verification = verifySignedPe(signed);
-    if (verification.signer.x509.fingerprint256 !== session.certificate.x509.fingerprint256) {
-      throw new SignError("self-verification found a different signer certificate than the session certificate");
-    }
-    if (timestamp && !verification.timestamp) throw new SignError("self-verification could not find the embedded timestamp");
+    checkSelfVerification(session, verification, prepared, timestamp);
   }
-  return { signed, peHash: prepared.peHash, signature, timestamp, chain, verification };
+  return { kind: "pe", signed, digest: prepared.digest, signature, timestamp, chain, verification };
+}
+async function signMsi(session, bytes, options = {}) {
+  const log = options.log ?? silentLogger;
+  const parsed = parseCompoundFile(bytes);
+  if (isMsiSigned(parsed)) alreadySigned(options, log);
+  const file = stripMsiSignature(parsed);
+  const prehash = msiPrehash(file, "sha256");
+  const withExtended = withExtendedSignature(file, prehash);
+  const digest = msiDigest(withExtended, "sha256");
+  const prepared = prepareIndirectData(spcSipInfo(), digest, { description: options.description, url: options.url, signingTime: options.signingTime ?? /* @__PURE__ */ new Date() });
+  const { pkcs7, signature, timestamp, chain } = await signPrepared(session, prepared, options, log);
+  const signed = writeCompoundFile(embedMsiSignature(withExtended, pkcs7, prehash));
+  let verification = null;
+  if (options.verify !== false) {
+    verification = verifySignedMsi(signed);
+    checkSelfVerification(session, verification, prepared, timestamp);
+  }
+  return { kind: "msi", signed, digest, signature, timestamp, chain, verification };
+}
+async function signFile(session, bytes, options = {}) {
+  return detectImageKind(bytes) === "pe" ? signPe(session, bytes, options) : signMsi(session, bytes, options);
 }
 
 // src/totp.ts
-var import_node_crypto10 = require("node:crypto");
+var import_node_crypto11 = require("node:crypto");
 var TotpError = class extends Error {
   constructor(message2) {
     super(message2);
@@ -23609,7 +24168,7 @@ function parseTotpSecret(input) {
 function totpCode(params, unixSeconds = Math.floor(Date.now() / 1e3)) {
   const counter = Buffer.alloc(8);
   counter.writeBigUInt64BE(BigInt(Math.floor(unixSeconds / params.period)));
-  const mac = (0, import_node_crypto10.createHmac)(params.algorithm, params.secret).update(counter).digest();
+  const mac = (0, import_node_crypto11.createHmac)(params.algorithm, params.secret).update(counter).digest();
   const offset = mac[mac.length - 1] & 15;
   const bin = (mac[offset] & 127) << 24 | mac[offset + 1] << 16 | mac[offset + 2] << 8 | mac[offset + 3];
   return (bin % 10 ** params.digits).toString().padStart(params.digits, "0");
@@ -23656,7 +24215,7 @@ var actionLogger = {
   }
 };
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function resolveOtpCode(inputs) {
+async function resolveOtpCode(inputs, nextWindow = false) {
   if (inputs.otpSeed && inputs.otpCode) throw new Error("set only one of otp-seed and otp-code");
   if (!inputs.otpSeed && !inputs.otpCode) throw new Error("authentication required: set otp-seed (TOTP seed) or otp-code (a current 6-digit code)");
   if (inputs.otpCode) {
@@ -23668,7 +24227,7 @@ async function resolveOtpCode(inputs) {
   const params = parseTotpSecret(inputs.otpSeed);
   try {
     const left = secondsLeftInWindow(params);
-    if (left < 4) {
+    if (nextWindow || left < 4) {
       info(`waiting ${left}s for the next one-time-code window`);
       await sleep2(left * 1e3 + 250);
     }
@@ -23678,6 +24237,19 @@ async function resolveOtpCode(inputs) {
   } finally {
     wipe(params.secret);
   }
+}
+async function openSession(inputs) {
+  return withFreshCodeRetry(
+    async (nextWindow) => CloudSession.open({
+      email: inputs.email,
+      otpCode: await resolveOtpCode(inputs, nextWindow),
+      cardSerial: inputs.cardSerial || void 0,
+      userAgent: USER_AGENT,
+      log: actionLogger
+    }),
+    Boolean(inputs.otpSeed),
+    actionLogger
+  );
 }
 function guardEvent(inputs) {
   const event = process.env["GITHUB_EVENT_NAME"] ?? "";
@@ -23727,14 +24299,7 @@ async function run() {
   }
   const extraCertificates = await loadChain(inputs.chainFile);
   info(`${files.length} file(s) to sign`);
-  const otpCode = await resolveOtpCode(inputs);
-  const session = await CloudSession.open({
-    email: inputs.email,
-    otpCode,
-    cardSerial: inputs.cardSerial || void 0,
-    userAgent: USER_AGENT,
-    log: actionLogger
-  });
+  const session = await openSession(inputs);
   const cert = session.certificate.x509;
   setOutput("certificate-subject", oneLineName(cert.subject));
   setOutput("certificate-fingerprint", cert.fingerprint256);
@@ -23743,7 +24308,7 @@ async function run() {
   for (const file of files) {
     await group(`Signing ${file}`, async () => {
       const original = await (0, import_promises2.readFile)(file);
-      const result = await signPe(session, original, {
+      const result = await signFile(session, original, {
         description: inputs.description || void 0,
         url: inputs.url || void 0,
         timestampUrl: inputs.timestampUrl || null,
@@ -23756,10 +24321,10 @@ async function run() {
       const target = inputs.outputDir ? import_node_path2.default.join(inputs.outputDir, import_node_path2.default.basename(file)) : file;
       if (inputs.backup && !inputs.outputDir) info(`original kept as ${await writeBackup(file, original)}`);
       await writeFileAtomic(target, result.signed);
-      const sha2562 = (0, import_node_crypto11.createHash)("sha256").update(result.signed).digest("hex");
+      const sha2562 = (0, import_node_crypto12.createHash)("sha256").update(result.signed).digest("hex");
       const timestamp = result.timestamp?.genTime.toISOString() ?? null;
-      signed.push({ path: target, sha256: sha2562, bytes: result.signed.length, timestamp });
-      info(`signed ${target} (${result.signed.length} bytes, sha256 ${sha2562}${timestamp ? `, timestamped ${timestamp}` : ", not timestamped"})`);
+      signed.push({ path: target, kind: result.kind, sha256: sha2562, bytes: result.signed.length, timestamp });
+      info(`signed ${target} (${result.kind === "msi" ? "MSI package" : "PE image"}, ${result.signed.length} bytes, sha256 ${sha2562}${timestamp ? `, timestamped ${timestamp}` : ", not timestamped"})`);
     });
   }
   setOutput("signed-files", JSON.stringify(signed));

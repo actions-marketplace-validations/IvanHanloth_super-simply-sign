@@ -1,12 +1,15 @@
 /**
- * Step 3 and 5 — the local Authenticode work:
+ * Step 3 and 5 — the local Authenticode work, shared by PE images and MSI
+ * packages (they differ only in how the file digest is computed and which
+ * SpcAttributeTypeAndOptionalValue names the file type):
  *
- *  - `prepare`  : hash the PE, build the SpcIndirectDataContent and the signed
+ *  - `prepare*` : build the SpcIndirectDataContent and the signed
  *    attributes, and return the SHA-256 the cloud HSM must sign (over the
  *    DER SET of signed attributes — that is what an RSA PKCS#1 v1.5 signature
  *    with SHA-256 covers).
- *  - `finalize` : wrap [signed attributes + signature + certificate chain +
- *    RFC 3161 token] into a PKCS#7 SignedData and splice it into the PE.
+ *  - `buildSignedData` : wrap [signed attributes + signature + certificate
+ *    chain + RFC 3161 token] into a PKCS#7 SignedData; `finalize` splices
+ *    that into a PE (the MSI counterpart lives in `signer.ts` via `msi.ts`).
  */
 import { createHash } from 'node:crypto';
 import { OID_CONTENT_TYPE, OID_MESSAGE_DIGEST, OID_PKCS7_SIGNED_DATA, OID_RSA_ENCRYPTION, OID_SHA256, OID_SIGNING_TIME } from './cms.ts';
@@ -41,10 +44,15 @@ export function digestInfo(hashOid: string, hash: Uint8Array): Buffer {
   return der.seq(der.seq(der.oid(hashOid), der.nul()), der.octetString(hash));
 }
 
-/** `SpcIndirectDataContent { data SpcAttributeTypeAndOptionalValue, messageDigest DigestInfo }`. */
-export function spcIndirectDataContent(peHash: Uint8Array): { der: Buffer; content: Buffer } {
-  const content = der.concat(spcPeImageData(), digestInfo(OID_SHA256, peHash));
+/** `SpcIndirectDataContent { data SpcAttributeTypeAndOptionalValue, messageDigest DigestInfo }` for any file type. */
+export function spcIndirectData(attribute: Buffer, hash: Uint8Array): { der: Buffer; content: Buffer } {
+  const content = der.concat(attribute, digestInfo(OID_SHA256, hash));
   return { der: der.tlv(0x30, content), content };
+}
+
+/** The PE flavour of `spcIndirectData`. */
+export function spcIndirectDataContent(peHash: Uint8Array): { der: Buffer; content: Buffer } {
+  return spcIndirectData(spcPeImageData(), peHash);
 }
 
 /**
@@ -69,8 +77,8 @@ export interface PrepareOptions {
 }
 
 export interface PreparedSignature {
-  /** Authenticode SHA-256 of the image. */
-  readonly peHash: Buffer;
+  /** The Authenticode SHA-256 digest of the file (PE image or MSI package). */
+  readonly digest: Buffer;
   /** The SpcIndirectDataContent SEQUENCE. */
   readonly spcIndirectData: Buffer;
   /** The signed attributes as a DER SET OF — hashed for signing and embedded as [0] IMPLICIT. */
@@ -79,10 +87,9 @@ export interface PreparedSignature {
   readonly toBeSigned: Buffer;
 }
 
-/** Build everything that can be built before the cloud signature exists. */
-export function prepare(pe: Uint8Array, options: PrepareOptions): PreparedSignature {
-  const peHash = authenticodeHash(pe, 'sha256');
-  const spc = spcIndirectDataContent(peHash);
+/** Build everything that can be built before the cloud signature exists, for a file digest already computed. */
+export function prepareIndirectData(fileTypeAttribute: Buffer, digest: Buffer, options: PrepareOptions): PreparedSignature {
+  const spc = spcIndirectData(fileTypeAttribute, digest);
   // Authenticode quirk: messageDigest is the hash of the SEQUENCE *content*.
   const messageDigest = sha256(spc.content);
   const attributes = [
@@ -93,7 +100,12 @@ export function prepare(pe: Uint8Array, options: PrepareOptions): PreparedSignat
   ];
   if (options.description || options.url) attributes.push(attribute(OID_SPC_SP_OPUS_INFO, spcSpOpusInfo(options.description, options.url)));
   const signedAttrsSet = der.setOf(attributes);
-  return { peHash, spcIndirectData: spc.der, signedAttrsSet, toBeSigned: sha256(signedAttrsSet) };
+  return { digest, spcIndirectData: spc.der, signedAttrsSet, toBeSigned: sha256(signedAttrsSet) };
+}
+
+/** `prepareIndirectData` for a PE image: hash it and use the SpcPeImageData attribute. */
+export function prepare(pe: Uint8Array, options: PrepareOptions): PreparedSignature {
+  return prepareIndirectData(spcPeImageData(), authenticodeHash(pe, 'sha256'), options);
 }
 
 /** The PKCS#7 `ContentInfo { signedData }` blob for a prepared signature. */

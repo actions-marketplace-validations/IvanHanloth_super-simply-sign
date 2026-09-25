@@ -12,7 +12,7 @@ const HELLO_HASH = 'bc17b1c98515d63f366bcd9f472054ae49cd5e839043265ce060b38b33ca
 test('an image signed by signtool (with a genuine Certum timestamp) verifies end to end', () => {
   const result = verifySignedPe(signtoolSigned);
   assert.equal(result.hashAlgorithm, 'sha256');
-  assert.equal(result.peHash.toString('hex'), HELLO_HASH, 'signtool embedded the same Authenticode digest we compute');
+  assert.equal(result.digest.toString('hex'), HELLO_HASH, 'signtool embedded the same Authenticode digest we compute');
   assert.equal(result.signer.x509.subject, 'CN=SSS signtool cross-check');
   assert.equal(result.certificates.length, 1);
   assert.equal(result.description, 'signtool cross-check');

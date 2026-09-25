@@ -11,10 +11,13 @@
  *    early — that is how the OAuth code is picked off the redirect chain
  *    without ever requesting the redirect target;
  *  - a cookie jar scoped per origin, because the CAS login is cookie-based;
- *  - a hard timeout on every request;
+ *  - a hard timeout on every request, and a bounded retry for the answers that
+ *    carry no information — a dropped connection, a timeout, a 5xx — so a blip
+ *    between the runner and the cloud does not lose a whole signing run;
  *  - errors carry URLs with the query string stripped, so codes, tickets and
  *    tokens never leak into logs.
  */
+import type { Logger } from './log.ts';
 
 export class HttpError extends Error {
   readonly status: number | undefined;
@@ -96,6 +99,12 @@ export interface HttpClientOptions {
   readonly allowedOrigins: readonly string[];
   /** Permit `http:` for non-loopback hosts (only for the TSA, whose reply is signed). */
   readonly allowHttp?: boolean;
+  /** Extra attempts after a transport failure or a retriable status (default 2). */
+  readonly retries?: number;
+  /** First backoff in ms; it doubles per attempt and carries jitter (default 500). */
+  readonly retryBackoffMs?: number;
+  /** Where retries are announced, if anywhere. */
+  readonly log?: Logger;
 }
 
 export interface HttpRequest {
@@ -129,6 +138,18 @@ export interface FollowResult extends HttpResponse {
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Statuses that say "no answer yet", not "no": worth asking again. */
+const RETRIABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+/** `Retry-After` in milliseconds, when the server names a sane wait in seconds. */
+function retryAfterMs(headers: Headers): number | null {
+  const raw = headers.get('retry-after')?.trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds, 30) * 1000;
+}
 
 function describeFetchError(err: unknown): string {
   if (!(err instanceof Error)) return 'unknown error';
@@ -172,25 +193,44 @@ export class HttpClient {
     const headers = new Headers(request.headers ?? {});
     headers.set('user-agent', this.#options.userAgent);
     if (!headers.has('accept')) headers.set('accept', '*/*');
-    const cookie = this.jar.header(u.origin);
-    if (cookie) headers.set('cookie', cookie);
+    const retries = this.#options.retries ?? 2;
 
-    let response: Response;
-    let body: Buffer;
-    try {
-      response = await fetch(u, {
-        method: request.method ?? 'GET',
-        headers,
-        body: copyBody(request.body),
-        redirect: 'manual',
-        signal: AbortSignal.timeout(this.#options.timeoutMs),
-      });
-      body = Buffer.from(await response.arrayBuffer());
-    } catch (err) {
-      throw new HttpError(`request to ${redactUrl(u)} failed: ${describeFetchError(err)}`, u.toString());
+    for (let attempt = 0; ; attempt++) {
+      const cookie = this.jar.header(u.origin);
+      if (cookie) headers.set('cookie', cookie);
+
+      let response: Response;
+      let body: Buffer;
+      try {
+        response = await fetch(u, {
+          method: request.method ?? 'GET',
+          headers,
+          body: copyBody(request.body),
+          redirect: 'manual',
+          signal: AbortSignal.timeout(this.#options.timeoutMs),
+        });
+        body = Buffer.from(await response.arrayBuffer());
+      } catch (err) {
+        const failure = `request to ${redactUrl(u)} failed: ${describeFetchError(err)}`;
+        if (attempt >= retries) throw new HttpError(failure, u.toString());
+        await this.#pause(attempt, null, failure);
+        continue;
+      }
+      if (attempt < retries && RETRIABLE_STATUSES.has(response.status)) {
+        await this.#pause(attempt, retryAfterMs(response.headers), `${redactUrl(u)} answered HTTP ${response.status}`);
+        continue;
+      }
+      this.jar.store(u.origin, response.headers.getSetCookie());
+      return { status: response.status, headers: response.headers, url: u.toString(), body };
     }
-    this.jar.store(u.origin, response.headers.getSetCookie());
-    return { status: response.status, headers: response.headers, url: u.toString(), body };
+  }
+
+  /** Wait out one failed attempt: the delay the server asked for, else exponential backoff with jitter. */
+  async #pause(attempt: number, serverWaitMs: number | null, reason: string): Promise<void> {
+    const base = this.#options.retryBackoffMs ?? 500;
+    const ms = serverWaitMs ?? Math.round(base * 2 ** attempt * (1 + Math.random()));
+    this.#options.log?.info(`${reason}; retrying in ${ms}ms`);
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /** Request and follow redirects by hand (same origins only, bounded, observable). */

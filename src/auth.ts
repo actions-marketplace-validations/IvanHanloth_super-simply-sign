@@ -42,6 +42,32 @@ export class AuthError extends Error {
   }
 }
 
+/** The IdP turned the credentials down; a code from a fresh window may still work. */
+export class CredentialsRejectedError extends AuthError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CredentialsRejectedError';
+  }
+}
+
+/**
+ * Run `attempt`, and if the IdP refuses the credentials, run it once more with a
+ * code from the next window. Every code is burnt on use, so a job that logs in
+ * twice — sign the binaries, build the installer from them, sign that — replays
+ * the same code whenever both logins land inside one 30-second window.
+ * `canRefreshCode` is false when the caller was handed a literal code: there is
+ * no other one to try.
+ */
+export async function withFreshCodeRetry<T>(attempt: (nextWindow: boolean) => Promise<T>, canRefreshCode: boolean, log: Logger): Promise<T> {
+  try {
+    return await attempt(false);
+  } catch (err) {
+    if (!canRefreshCode || !(err instanceof CredentialsRejectedError)) throw err;
+    log.info('the one-time code was refused — it may already be spent, retrying with the next one');
+    return attempt(true);
+  }
+}
+
 export interface AccessToken {
   readonly accessToken: string;
   readonly expiresIn: number | null;
@@ -129,11 +155,8 @@ export async function login(http: HttpClient, config: OAuthConfig, email: string
   }
   if (!found.code) {
     const errorPage = /class=["'][^"']*\berrors?\b[^"']*["']/i.test(result.body.toString('utf8'));
-    throw new AuthError(
-      errorPage
-        ? 'login rejected by the identity provider — wrong e-mail or OTP, or a one-time code that was already used'
-        : `login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`,
-    );
+    if (errorPage) throw new CredentialsRejectedError('login rejected by the identity provider — wrong e-mail or OTP, or a one-time code that was already used');
+    throw new AuthError(`login did not produce an authorization code (HTTP ${result.status} at ${redactUrl(result.url)})`);
   }
   log.secret(found.code);
   log.debug(`authorization code received after ${result.hops.length} redirect(s)`);

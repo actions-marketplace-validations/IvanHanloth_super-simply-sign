@@ -7,9 +7,10 @@ import * as glob from '@actions/glob';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { withFreshCodeRetry } from './auth.ts';
 import { writeBackup, writeFileAtomic } from './fsutil.ts';
 import type { Logger } from './log.ts';
-import { CloudSession, USER_AGENT, signPe } from './signer.ts';
+import { CloudSession, USER_AGENT, signFile } from './signer.ts';
 import { isValidOtpCode, parseTotpSecret, secondsLeftInWindow, totpCode, wipe } from './totp.ts';
 import { oneLineName, parseCertificate, pemBlocks, type CertificateInfo } from './x509.ts';
 
@@ -72,7 +73,7 @@ const actionLogger: Logger = {
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Turn the seed or the literal code input into the code to log in with. */
-async function resolveOtpCode(inputs: Inputs): Promise<string> {
+async function resolveOtpCode(inputs: Inputs, nextWindow = false): Promise<string> {
   if (inputs.otpSeed && inputs.otpCode) throw new Error('set only one of otp-seed and otp-code');
   if (!inputs.otpSeed && !inputs.otpCode) throw new Error('authentication required: set otp-seed (TOTP seed) or otp-code (a current 6-digit code)');
   if (inputs.otpCode) {
@@ -83,9 +84,10 @@ async function resolveOtpCode(inputs: Inputs): Promise<string> {
   core.setSecret(inputs.otpSeed);
   const params = parseTotpSecret(inputs.otpSeed);
   try {
-    // A code submitted seconds before its window closes may be rejected; wait for a fresh one.
+    // A code submitted seconds before its window closes may be rejected, and so is one
+    // an earlier login already spent; both are cured by waiting the window out.
     const left = secondsLeftInWindow(params);
-    if (left < 4) {
+    if (nextWindow || left < 4) {
       core.info(`waiting ${left}s for the next one-time-code window`);
       await sleep(left * 1000 + 250);
     }
@@ -95,6 +97,22 @@ async function resolveOtpCode(inputs: Inputs): Promise<string> {
   } finally {
     wipe(params.secret);
   }
+}
+
+/** Log in, retrying once in the next one-time-code window if the code was refused. */
+async function openSession(inputs: Inputs): Promise<CloudSession> {
+  return withFreshCodeRetry(
+    async (nextWindow) =>
+      CloudSession.open({
+        email: inputs.email,
+        otpCode: await resolveOtpCode(inputs, nextWindow),
+        cardSerial: inputs.cardSerial || undefined,
+        userAgent: USER_AGENT,
+        log: actionLogger,
+      }),
+    Boolean(inputs.otpSeed),
+    actionLogger,
+  );
 }
 
 function guardEvent(inputs: Inputs): void {
@@ -128,6 +146,7 @@ async function loadChain(chainFile: string): Promise<CertificateInfo[]> {
 
 interface SignedFile {
   readonly path: string;
+  readonly kind: 'pe' | 'msi';
   readonly sha256: string;
   readonly bytes: number;
   readonly timestamp: string | null;
@@ -158,14 +177,7 @@ async function run(): Promise<void> {
   const extraCertificates = await loadChain(inputs.chainFile);
   core.info(`${files.length} file(s) to sign`);
 
-  const otpCode = await resolveOtpCode(inputs);
-  const session = await CloudSession.open({
-    email: inputs.email,
-    otpCode,
-    cardSerial: inputs.cardSerial || undefined,
-    userAgent: USER_AGENT,
-    log: actionLogger,
-  });
+  const session = await openSession(inputs);
   const cert = session.certificate.x509;
   core.setOutput('certificate-subject', oneLineName(cert.subject));
   core.setOutput('certificate-fingerprint', cert.fingerprint256);
@@ -175,7 +187,7 @@ async function run(): Promise<void> {
   for (const file of files) {
     await core.group(`Signing ${file}`, async () => {
       const original = await readFile(file);
-      const result = await signPe(session, original, {
+      const result = await signFile(session, original, {
         description: inputs.description || undefined,
         url: inputs.url || undefined,
         timestampUrl: inputs.timestampUrl || null,
@@ -190,8 +202,8 @@ async function run(): Promise<void> {
       await writeFileAtomic(target, result.signed);
       const sha256 = createHash('sha256').update(result.signed).digest('hex');
       const timestamp = result.timestamp?.genTime.toISOString() ?? null;
-      signed.push({ path: target, sha256, bytes: result.signed.length, timestamp });
-      core.info(`signed ${target} (${result.signed.length} bytes, sha256 ${sha256}${timestamp ? `, timestamped ${timestamp}` : ', not timestamped'})`);
+      signed.push({ path: target, kind: result.kind, sha256, bytes: result.signed.length, timestamp });
+      core.info(`signed ${target} (${result.kind === 'msi' ? 'MSI package' : 'PE image'}, ${result.signed.length} bytes, sha256 ${sha256}${timestamp ? `, timestamped ${timestamp}` : ', not timestamped'})`);
     });
   }
 

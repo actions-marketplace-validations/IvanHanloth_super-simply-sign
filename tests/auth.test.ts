@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AuthError, extractHiddenInput, login } from '../src/auth.ts';
+import { AuthError, CredentialsRejectedError, extractHiddenInput, login, withFreshCodeRetry } from '../src/auth.ts';
 import { HttpClient } from '../src/http.ts';
 import { consoleLogger } from '../src/log.ts';
 import { OID_EKU_CODE_SIGNING, OID_EKU_TIME_STAMPING, makeCertificate } from './helpers/mini-x509.ts';
@@ -16,7 +16,8 @@ test('extractHiddenInput tolerates attribute order, quoting and entities', () =>
 
 function clientFor(mock: MockCertum): HttpClient {
   const o = mock.endpoints.oauth;
-  return new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [o.authorizeUrl, o.loginUrl, o.tokenUrl, o.redirectUri] });
+  // retries off: these assert the exact request sequence, which a repeated attempt would change.
+  return new HttpClient({ userAgent: 'test', timeoutMs: 5000, allowedOrigins: [o.authorizeUrl, o.loginUrl, o.tokenUrl, o.redirectUri], retries: 0 });
 }
 
 test('the CAS authorization-code dance yields a bearer token without ever requesting the redirect target', async () => {
@@ -46,11 +47,42 @@ test('the CAS authorization-code dance yields a bearer token without ever reques
     assert.ok(mock.requests.every((r) => r.headers['user-agent'] === 'test'));
 
     // A one-time code is single use, and a wrong one is reported as a login rejection.
-    await assert.rejects(login(clientFor(mock), mock.endpoints.oauth, 'me@example.com', '123456', log), (err: unknown) => err instanceof AuthError && /rejected/.test(err.message));
+    // Replays are told apart by their type: that is what drives the retry in a fresh window.
+    await assert.rejects(
+      login(clientFor(mock), mock.endpoints.oauth, 'me@example.com', '123456', log),
+      (err: unknown) => err instanceof CredentialsRejectedError && err instanceof AuthError && /already used/.test(err.message),
+    );
     await assert.rejects(login(clientFor(mock), mock.endpoints.oauth, 'me@example.com', '000000', log), /rejected by the identity provider/);
     await assert.rejects(login(clientFor(mock), mock.endpoints.oauth, 'someone@else.com', '654321', log), /rejected/);
     assert.deepEqual(mock.usedCodes, ['123456']);
   } finally {
     await mock.close();
   }
+});
+
+test('a refused one-time code is retried once in the next window', async () => {
+  const log = consoleLogger();
+  const refused = (): Promise<never> => Promise.reject(new CredentialsRejectedError('login rejected by the identity provider — a one-time code that was already used'));
+
+  // The replay is retried with a code from the next window, and that one carries the session.
+  const windows: boolean[] = [];
+  const onSecondTry = async (nextWindow: boolean): Promise<string> => {
+    windows.push(nextWindow);
+    return windows.length === 1 ? refused() : 'session';
+  };
+  assert.equal(await withFreshCodeRetry(onSecondTry, true, log), 'session');
+  assert.deepEqual(windows, [false, true]);
+
+  // A literal code cannot be refreshed, a refused retry surfaces, and other failures are not retried at all.
+  await assert.rejects(withFreshCodeRetry(refused, false, log), CredentialsRejectedError);
+  await assert.rejects(withFreshCodeRetry(refused, true, log), CredentialsRejectedError);
+  let attempts = 0;
+  await assert.rejects(
+    withFreshCodeRetry(() => {
+      attempts += 1;
+      return Promise.reject(new AuthError('has the SimplySign login flow changed?'));
+    }, true, log),
+    AuthError,
+  );
+  assert.equal(attempts, 1);
 });
